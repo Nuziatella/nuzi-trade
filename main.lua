@@ -13,7 +13,7 @@ end
 local addon = {
     name = "Nuzi Trade",
     author = "Nuzi",
-    version = "0.2.0",
+    version = "0.2.1",
     desc = "Trade pack values"
 }
 
