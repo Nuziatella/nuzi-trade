@@ -284,7 +284,13 @@ local function setLabelColor(label, rgba)
 end
 
 local function createLabel(id, parent, text, x, y, width, height, fontSize)
+    if api.Interface == nil or api.Interface.CreateWidget == nil then
+        return nil
+    end
     local label = api.Interface:CreateWidget("label", id, parent)
+    if label == nil then
+        return nil
+    end
     label:AddAnchor("TOPLEFT", x, y)
     label:SetExtent(width or 100, height or 18)
     label:SetText(text or "")
@@ -303,7 +309,13 @@ local function createLabel(id, parent, text, x, y, width, height, fontSize)
 end
 
 local function createButton(id, parent, text, x, y, width, height)
+    if api.Interface == nil or api.Interface.CreateWidget == nil then
+        return nil
+    end
     local button = api.Interface:CreateWidget("button", id, parent)
+    if button == nil then
+        return nil
+    end
     button:AddAnchor("TOPLEFT", x, y)
     button:SetExtent(width or 80, height or 26)
     button:SetText(text or "")
@@ -377,9 +389,12 @@ local function createEdit(id, parent, text, x, y, width, maxLength)
         end)
     end
     if field.SetInitVal ~= nil then
-        pcall(function()
-            field:SetInitVal(tostring(text or ""))
-        end)
+        local initValue = tonumber(text)
+        if initValue ~= nil then
+            pcall(function()
+                field:SetInitVal(initValue)
+            end)
+        end
     end
     if field.SetMaxTextLength ~= nil and maxLength ~= nil then
         pcall(function()
@@ -1620,9 +1635,11 @@ local function createUi()
     if App.ui.button == nil then
         local parent = api.rootWindow
         local button = createButton("nuziTradeToggleButton", parent, "NT", App.settings.button_x, App.settings.button_y, 44, 28)
-        button:SetHandler("OnClick", function()
-            toggleWindow()
-        end)
+        if button ~= nil and button.SetHandler ~= nil then
+            button:SetHandler("OnClick", function()
+                toggleWindow()
+            end)
+        end
         App.ui.button = button
     end
 
@@ -1630,7 +1647,14 @@ local function createUi()
         return
     end
 
+    if api.Interface == nil or api.Interface.CreateWindow == nil then
+        return
+    end
+
     local window = api.Interface:CreateWindow("nuziTradeWindow", "Nuzi Trade", 640, 430)
+    if window == nil then
+        return
+    end
     window:AddAnchor("CENTER", "UIParent", 0, 0)
     pcall(function()
         window:SetHandler("OnCloseByEsc", closeWindow)
@@ -1674,21 +1698,30 @@ local function createUi()
     createLabel("nuziTradeManualPercentLabel", window, "Live %", 18, 138, 54, 18, 13)
     App.ui.controls.percent_input = createEdit("nuziTradeManualPercent", window, App.settings.manual_percent_text or "130", 84, 132, 96, 8)
 
-    createButton("nuziTradeRefresh", window, "Refresh", 506, 84, 116, 40):SetHandler("OnClick", function()
-        refreshAll(true)
-        refreshUi()
-    end)
+    local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 506, 84, 116, 40)
+    if refreshButton ~= nil and refreshButton.SetHandler ~= nil then
+        refreshButton:SetHandler("OnClick", function()
+            refreshAll(true)
+            refreshUi()
+        end)
+    end
 
     App.ui.controls.page_value = createLabel("nuziTradePageValue", window, "", 18, 170, 180, 18, 12)
 
-    createButton("nuziTradePrevPage", window, "Prev Page", 438, 164, 88, 24):SetHandler("OnClick", function()
-        cyclePage(-1)
-        refreshUi()
-    end)
-    createButton("nuziTradeNextPage", window, "Next Page", 534, 164, 88, 24):SetHandler("OnClick", function()
-        cyclePage(1)
-        refreshUi()
-    end)
+    local prevButton = createButton("nuziTradePrevPage", window, "Prev Page", 438, 164, 88, 24)
+    if prevButton ~= nil and prevButton.SetHandler ~= nil then
+        prevButton:SetHandler("OnClick", function()
+            cyclePage(-1)
+            refreshUi()
+        end)
+    end
+    local nextButton = createButton("nuziTradeNextPage", window, "Next Page", 534, 164, 88, 24)
+    if nextButton ~= nil and nextButton.SetHandler ~= nil then
+        nextButton:SetHandler("OnClick", function()
+            cyclePage(1)
+            refreshUi()
+        end)
+    end
 
     createLabel("nuziTradePackHeader", window, "Pack", 18, 200, 290, 18, 12)
     createLabel("nuziTradeCurrencyHeader", window, "Currency", 330, 200, 120, 18, 12)
