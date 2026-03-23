@@ -13,7 +13,7 @@ end
 local addon = {
     name = "Nuzi Trade",
     author = "Nuzi",
-    version = "0.2.1",
+    version = "0.2.2",
     desc = "Trade pack values"
 }
 
@@ -21,6 +21,7 @@ local SETTINGS_ID = "nuzi_trade"
 local MAX_ROUTE_PERCENT = 130
 local ROWS_PER_PAGE = 10
 local ALL_PACKS_LABEL = "All Packs"
+local ALL_DESTINATIONS_LABEL = "All Destinations"
 
 local STRIP_SUFFIXES = {
     peninsula = true,
@@ -1041,6 +1042,16 @@ local function getSelectedDestinationName()
     return tostring(entry.static_name or entry.name or "")
 end
 
+local function isAllDestinationsEntry(entry)
+    if type(entry) ~= "table" then
+        return false
+    end
+    if entry.all == true then
+        return true
+    end
+    return normalizeKey(entry.static_name or entry.name) == normalizeKey(ALL_DESTINATIONS_LABEL)
+end
+
 local function getSelectedPackName()
     local entry = App.packs[App.selected_pack_index]
     if entry == nil then
@@ -1236,12 +1247,14 @@ local function buildStaticDestinationEntries(originName)
     ensurePriceIndex()
     local destinations = {}
     local seen = {}
+    local totalRowCount = 0
 
     for _, canonicalName in pairs(App.static_destinations or {}) do
         if not seen[canonicalName] then
             seen[canonicalName] = true
             local rows = buildRouteRows(originName, canonicalName, nil)
             if #rows > 0 then
+                totalRowCount = totalRowCount + #rows
                 table.insert(destinations, {
                     id = nil,
                     name = canonicalName,
@@ -1256,6 +1269,17 @@ local function buildStaticDestinationEntries(originName)
     table.sort(destinations, function(a, b)
         return normalizeKey(a.static_name or a.name) < normalizeKey(b.static_name or b.name)
     end)
+
+    if #destinations > 0 then
+        table.insert(destinations, 1, {
+            id = nil,
+            name = ALL_DESTINATIONS_LABEL,
+            static_name = ALL_DESTINATIONS_LABEL,
+            percent = nil,
+            row_count = totalRowCount,
+            all = true
+        })
+    end
 
     return destinations
 end
@@ -1342,6 +1366,62 @@ local function parseManualPercent(text)
     return normalizeRoutePercent(normalized)
 end
 
+local function filterRouteRowsByPack(rows, packName)
+    if trim(packName) == "" then
+        return rows or {}
+    end
+
+    local filteredRows = {}
+    local wanted = normalizeKey(packName)
+    for _, row in ipairs(rows or {}) do
+        if normalizeKey(row.pack_name) == wanted then
+            table.insert(filteredRows, row)
+        end
+    end
+    return filteredRows
+end
+
+local function buildAllDestinationRouteRows(originName, percent, packName)
+    local routeRows = {}
+    local selectedPack = trim(packName)
+
+    for _, destination in ipairs(App.destinations or {}) do
+        if not isAllDestinationsEntry(destination) then
+            local destinationName = destination.static_name or destination.name
+            local rows = buildRouteRows(originName, destinationName, percent)
+            rows = filterRouteRowsByPack(rows, selectedPack)
+
+            for _, row in ipairs(rows) do
+                table.insert(routeRows, {
+                    destination_name = destinationName,
+                    pack_name = row.pack_name,
+                    currency = row.currency,
+                    max_price = row.max_price,
+                    max_price_text = row.max_price_text,
+                    current_price = row.current_price
+                })
+            end
+        end
+    end
+
+    table.sort(routeRows, function(a, b)
+        local leftDestination = tostring(a.destination_name or "")
+        local rightDestination = tostring(b.destination_name or "")
+        if leftDestination == rightDestination then
+            if tostring(a.pack_name or "") == tostring(b.pack_name or "") then
+                if tostring(a.currency or "") == tostring(b.currency or "") then
+                    return (tonumber(a.max_price) or 0) < (tonumber(b.max_price) or 0)
+                end
+                return tostring(a.currency or "") < tostring(b.currency or "")
+            end
+            return tostring(a.pack_name or "") < tostring(b.pack_name or "")
+        end
+        return leftDestination < rightDestination
+    end)
+
+    return routeRows
+end
+
 local function refreshSelectedRoute()
     local origin = App.origins[App.selected_origin_index]
     local destination = App.destinations[App.selected_destination_index]
@@ -1352,17 +1432,14 @@ local function refreshSelectedRoute()
     end
 
     local manualPercent = parseManualPercent(App.settings.manual_percent_text)
-    local rows = buildRouteRows(origin.name, destination.static_name or destination.name, manualPercent)
     local selectedPack = getSelectedPackFilter()
-    if selectedPack ~= "" then
-        local filteredRows = {}
-        local wanted = normalizeKey(selectedPack)
-        for _, row in ipairs(rows) do
-            if normalizeKey(row.pack_name) == wanted then
-                table.insert(filteredRows, row)
-            end
-        end
-        rows = filteredRows
+    local rows = {}
+
+    if isAllDestinationsEntry(destination) then
+        rows = buildAllDestinationRouteRows(origin.name, manualPercent, selectedPack)
+    else
+        rows = buildRouteRows(origin.name, destination.static_name or destination.name, manualPercent)
+        rows = filterRouteRowsByPack(rows, selectedPack)
     end
 
     App.current_percent = manualPercent
@@ -1512,6 +1589,9 @@ local function refreshUi()
     local destinationIndexText = destinationTotal > 0 and tostring(App.selected_destination_index) or "0"
     local pageCount = math.max(1, math.ceil(#App.route_rows / ROWS_PER_PAGE))
     local rowStart = ((App.route_page_index - 1) * ROWS_PER_PAGE) + 1
+    local selectedDestination = App.destinations[App.selected_destination_index]
+    local allDestinationsMode = isAllDestinationsEntry(selectedDestination)
+    local selectedPack = getSelectedPackFilter()
 
     local originItems = {}
     for _, entry in ipairs(App.origins or {}) do
@@ -1555,13 +1635,26 @@ local function refreshUi()
     safeSetText(App.ui.controls.pack_meta, string.format("%s / %d", packIndexText, packTotal))
     safeSetText(App.ui.controls.destination_meta, string.format("%s / %d", destinationIndexText, destinationTotal))
     safeSetText(App.ui.controls.page_value, string.format("Page %d / %d", App.route_page_index, pageCount))
+    safeSetText(App.ui.controls.pack_header, allDestinationsMode and (selectedPack ~= "" and "Destination" or "Destination / Pack") or "Pack")
+    safeSetText(App.ui.controls.currency_header, "Currency")
+    safeSetText(App.ui.controls.cap_header, string.format("%s%%", tostring(App.current_percent or MAX_ROUTE_PERCENT)))
+    safeSetText(App.ui.controls.live_header, "Live")
 
     for index = 1, ROWS_PER_PAGE do
         local widgets = App.ui.rows[index]
         local row = App.route_rows[rowStart + index - 1]
         if widgets ~= nil then
             if row ~= nil then
-                safeSetText(widgets.pack, tostring(row.pack_name or ""))
+                local packText = tostring(row.pack_name or "")
+                if allDestinationsMode then
+                    local destinationName = tostring(row.destination_name or "")
+                    if selectedPack ~= "" then
+                        packText = destinationName
+                    else
+                        packText = string.format("%s - %s", destinationName, tostring(row.pack_name or ""))
+                    end
+                end
+                safeSetText(widgets.pack, packText)
                 safeSetText(widgets.currency, tostring(row.currency or ""))
                 if tostring(row.currency or "") == "Gold" then
                     safeSetText(widgets.cap, row.max_price_text ~= nil and tostring(row.max_price_text) or formatGold(row.max_price))
@@ -1723,10 +1816,10 @@ local function createUi()
         end)
     end
 
-    createLabel("nuziTradePackHeader", window, "Pack", 18, 200, 290, 18, 12)
-    createLabel("nuziTradeCurrencyHeader", window, "Currency", 330, 200, 120, 18, 12)
-    createLabel("nuziTradeCapHeader", window, "130%", 470, 200, 50, 18, 12)
-    createLabel("nuziTradeLiveHeader", window, "Live", 544, 200, 60, 18, 12)
+    App.ui.controls.pack_header = createLabel("nuziTradePackHeader", window, "Pack", 18, 200, 290, 18, 12)
+    App.ui.controls.currency_header = createLabel("nuziTradeCurrencyHeader", window, "Currency", 330, 200, 120, 18, 12)
+    App.ui.controls.cap_header = createLabel("nuziTradeCapHeader", window, "130%", 470, 200, 50, 18, 12)
+    App.ui.controls.live_header = createLabel("nuziTradeLiveHeader", window, "Live", 544, 200, 60, 18, 12)
 
     for index = 1, ROWS_PER_PAGE do
         local y = 224 + ((index - 1) * 18)
