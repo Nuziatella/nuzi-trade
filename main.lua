@@ -13,7 +13,7 @@ end
 local addon = {
     name = "Nuzi Trade",
     author = "Nuzi",
-    version = "0.2.2",
+    version = "0.2.3",
     desc = "Trade pack values"
 }
 
@@ -622,6 +622,21 @@ local function loadPriceRows()
     return App.price_rows
 end
 
+local function shouldIncludeTradeRow(destination, currency)
+    local normalizedDestination = normalizeKey(destination)
+    local normalizedCurrency = normalizeKey(currency)
+
+    if normalizedDestination == "diamond shores" and (
+        normalizedCurrency == "charcoal stabilizer" or
+        normalizedCurrency == "dragon stabilizer" or
+        normalizedCurrency == "gilda star"
+    ) then
+        return false
+    end
+
+    return true
+end
+
 local function saveSettings()
     if App.settings == nil then
         return
@@ -629,6 +644,61 @@ local function saveSettings()
     pcall(function()
         api.SaveSettings()
     end)
+end
+
+local function saveButtonPosition(button)
+    if button == nil or App.settings == nil then
+        return
+    end
+
+    local x = nil
+    local y = nil
+    pcall(function()
+        if button.GetOffset ~= nil then
+            x, y = button:GetOffset()
+            return
+        end
+        if button.GetEffectiveOffset ~= nil then
+            x, y = button:GetEffectiveOffset()
+        end
+    end)
+
+    x = tonumber(x)
+    y = tonumber(y)
+    if x == nil or y == nil then
+        return
+    end
+
+    App.settings.button_x = x
+    App.settings.button_y = y
+    saveSettings()
+end
+
+local function enableDrag(widget, onStop)
+    if widget == nil then
+        return
+    end
+    if widget.RegisterForDrag ~= nil then
+        widget:RegisterForDrag("LeftButton")
+    end
+    if widget.EnableDrag ~= nil then
+        widget:EnableDrag(true)
+    end
+    if widget.SetHandler ~= nil then
+        widget:SetHandler("OnDragStart", function(self)
+            if self.StartMoving ~= nil then
+                self:StartMoving()
+            end
+        end)
+        widget:SetHandler("OnDragStop", function(self)
+            if self.StopMovingOrSizing ~= nil then
+                self:StopMovingOrSizing()
+            end
+            if onStop ~= nil then
+                onStop(self)
+            end
+        end)
+    end
 end
 
 local function loadSettings()
@@ -679,7 +749,7 @@ local function ensurePriceIndex()
             local destination = trim(row.destination or row.dest)
             local currency = trim(row.currency)
             local price = tonumber(row.price)
-            if packName ~= "" and destination ~= "" and price ~= nil then
+            if packName ~= "" and destination ~= "" and price ~= nil and shouldIncludeTradeRow(destination, currency) then
                 local dedupeKey = table.concat({
                     normalizeKey(packName),
                     normalizeKey(destination),
@@ -1731,6 +1801,9 @@ local function createUi()
         if button ~= nil and button.SetHandler ~= nil then
             button:SetHandler("OnClick", function()
                 toggleWindow()
+            end)
+            enableDrag(button, function(self)
+                saveButtonPosition(self)
             end)
         end
         App.ui.button = button
