@@ -13,15 +13,18 @@ end
 local addon = {
     name = "Nuzi Trade",
     author = "Nuzi",
-    version = "0.2.3",
+    version = "0.2.4",
     desc = "Trade pack values"
 }
 
 local SETTINGS_ID = "nuzi_trade"
+local SETTINGS_FILE_PATH = "nuzi-trade/settings.txt"
+local ROUTE_TIMES_FILE_PATH = "nuzi-trade/route_times.txt"
 local MAX_ROUTE_PERCENT = 130
 local ROWS_PER_PAGE = 10
 local ALL_PACKS_LABEL = "All Packs"
 local ALL_DESTINATIONS_LABEL = "All Destinations"
+local VEHICLE_TYPES = { "Hauler", "Car", "Boat" }
 
 local STRIP_SUFFIXES = {
     peninsula = true,
@@ -146,18 +149,59 @@ local App = {
     selected_origin_index = 1,
     selected_pack_index = 1,
     selected_destination_index = 1,
+    selected_vehicle_index = 1,
     route_page_index = 1,
     current_percent = nil,
     needs_refresh = true,
     closing_window = false,
     syncing_combo = false,
+    route_time_store = {},
+    route_timer = {
+        running = false,
+        started_at_ms = 0,
+        elapsed_ms = 0,
+        pending_save = false,
+        route_key = nil,
+        route_label = "",
+        vehicle_type = VEHICLE_TYPES[1],
+        status_text = "Select a specific destination and pack to time a route.",
+        last_render_second = nil
+    },
     ui = {
         button = nil,
         window = nil,
+        timer_window = nil,
         controls = {},
         rows = {}
     }
 }
+
+local refreshUi
+local applyRouteTimingToRow
+local updateTimerWidgetVisibility
+
+local function readTableFile(path)
+    if api.File == nil or api.File.Read == nil then
+        return nil
+    end
+    local ok, value = pcall(function()
+        return api.File:Read(path)
+    end)
+    if ok and type(value) == "table" then
+        return value
+    end
+    return nil
+end
+
+local function writeTableFile(path, value)
+    if api.File == nil or api.File.Write == nil or type(value) ~= "table" then
+        return false
+    end
+    local ok = pcall(function()
+        api.File:Write(path, value)
+    end)
+    return ok
+end
 
 local function trim(value)
     return (tostring(value or ""):gsub("^%s*(.-)%s*$", "%1"))
@@ -224,6 +268,73 @@ local function formatGold(value)
     local silver = math.floor((totalCopper % 10000) / 100)
     local copper = totalCopper % 100
     return string.format("%dg %02ds %02dc", gold, silver, copper)
+end
+
+local function getUiNowMs()
+    local now = nil
+    pcall(function()
+        if api.Time ~= nil and api.Time.GetUiMsec ~= nil then
+            now = api.Time:GetUiMsec()
+        end
+    end)
+    now = tonumber(now)
+    if now ~= nil then
+        return math.max(0, now)
+    end
+    if os ~= nil and os.clock ~= nil then
+        return math.floor(os.clock() * 1000)
+    end
+    return 0
+end
+
+local function formatRouteDuration(seconds)
+    local totalSeconds = tonumber(seconds)
+    if totalSeconds == nil or totalSeconds < 0 then
+        return "-"
+    end
+    totalSeconds = math.floor(totalSeconds + 0.5)
+    local hours = math.floor(totalSeconds / 3600)
+    local minutes = math.floor((totalSeconds % 3600) / 60)
+    local secs = totalSeconds % 60
+    if hours > 0 then
+        return string.format("%d:%02d:%02d", hours, minutes, secs)
+    end
+    return string.format("%02d:%02d", minutes, secs)
+end
+
+local function getVehicleTypeIndex(vehicleType)
+    local normalized = normalizeKey(vehicleType)
+    for index, name in ipairs(VEHICLE_TYPES) do
+        if normalizeKey(name) == normalized then
+            return index
+        end
+    end
+    return 1
+end
+
+local function getVehicleStorageKey(vehicleType)
+    local index = getVehicleTypeIndex(vehicleType)
+    return normalizeKey(VEHICLE_TYPES[index])
+end
+
+local function getSelectedVehicleType()
+    return VEHICLE_TYPES[App.selected_vehicle_index] or VEHICLE_TYPES[1]
+end
+
+local function buildRouteTimeSettingKey(routeKey, vehicleType)
+    local routePart = normalizeKey(routeKey):gsub("%s+", "_")
+    local vehiclePart = getVehicleStorageKey(vehicleType):gsub("%s+", "_")
+    return string.format("route_time_%s_%s", routePart, vehiclePart)
+end
+
+local function buildRouteTimerKey(originName, destinationName, packName)
+    local originKey = normalizeKey(originName)
+    local destinationKey = normalizeKey(destinationName)
+    local packKey = normalizeKey(packName)
+    if originKey == "" or destinationKey == "" or packKey == "" then
+        return nil
+    end
+    return table.concat({ originKey, destinationKey, packKey }, "|")
 end
 
 local function startsWith(text, prefix)
@@ -641,25 +752,147 @@ local function saveSettings()
     if App.settings == nil then
         return
     end
+    writeTableFile(SETTINGS_FILE_PATH, App.settings)
     pcall(function()
         api.SaveSettings()
     end)
 end
 
-local function saveButtonPosition(button)
-    if button == nil or App.settings == nil then
+local function saveRouteTimeStore()
+    if type(App.route_time_store) ~= "table" then
+        App.route_time_store = {}
+    end
+    writeTableFile(ROUTE_TIMES_FILE_PATH, App.route_time_store)
+end
+
+local function loadRouteTimeStore()
+    local routeTimes = readTableFile(ROUTE_TIMES_FILE_PATH)
+    if type(routeTimes) ~= "table" then
+        routeTimes = {}
+    end
+
+    if type(App.settings) == "table" then
+        for key, value in pairs(App.settings) do
+            local keyText = tostring(key or "")
+            if startsWith(keyText, "route_time_") then
+                local seconds = tonumber(value)
+                if seconds ~= nil and seconds >= 0 and routeTimes[keyText] == nil then
+                    routeTimes[keyText] = math.floor(seconds + 0.5)
+                end
+            end
+        end
+
+        local nested = App.settings.route_times
+        if type(nested) == "table" then
+            for routeKey, entry in pairs(nested) do
+                if type(routeKey) == "string" then
+                    if type(entry) == "table" then
+                        for _, vehicleType in ipairs(VEHICLE_TYPES) do
+                            local vehicleKey = getVehicleStorageKey(vehicleType)
+                            local seconds = tonumber(entry[vehicleKey])
+                            if seconds == nil and vehicleKey == "hauler" then
+                                seconds = tonumber(entry.default or entry.seconds or entry.time_seconds or entry.value)
+                            end
+                            if seconds ~= nil and seconds >= 0 then
+                                local flatKey = buildRouteTimeSettingKey(routeKey, vehicleType)
+                                if routeTimes[flatKey] == nil then
+                                    routeTimes[flatKey] = math.floor(seconds + 0.5)
+                                end
+                            end
+                        end
+                    else
+                        local seconds = tonumber(entry)
+                        if seconds ~= nil and seconds >= 0 then
+                            local flatKey = buildRouteTimeSettingKey(routeKey, VEHICLE_TYPES[1])
+                            if routeTimes[flatKey] == nil then
+                                routeTimes[flatKey] = math.floor(seconds + 0.5)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    App.route_time_store = routeTimes
+end
+
+local function getSavedRouteTimeSeconds(routeKey, vehicleType)
+    if App.settings == nil or routeKey == nil then
+        return nil
+    end
+
+    local vehicleKey = getVehicleStorageKey(vehicleType)
+    local flatKey = buildRouteTimeSettingKey(routeKey, vehicleType)
+    local legacyFlatKey = "route_time_" .. normalizeKey(routeKey):gsub("%s+", "_")
+    local stored = nil
+    if type(App.route_time_store) == "table" then
+        stored = App.route_time_store[flatKey]
+        if stored == nil then
+            stored = App.route_time_store[legacyFlatKey]
+        end
+    end
+    if stored == nil then
+        stored = App.settings[flatKey]
+    end
+    if stored == nil then
+        stored = App.settings[legacyFlatKey]
+    end
+    if stored == nil then
+        local nested = App.settings.route_times
+        if type(nested) == "table" then
+            local nestedValue = nested[routeKey]
+            if type(nestedValue) == "table" then
+                stored = nestedValue[vehicleKey]
+                if stored == nil then
+                    stored = nestedValue.default or nestedValue.seconds or nestedValue.time_seconds or nestedValue.value
+                end
+            else
+                stored = nestedValue
+            end
+        end
+    end
+    stored = tonumber(stored)
+    if stored == nil or stored < 0 then
+        return nil
+    end
+    return stored
+end
+
+local function setSavedRouteTimeSeconds(routeKey, vehicleType, seconds)
+    if App.settings == nil or routeKey == nil then
+        return false
+    end
+    local roundedSeconds = tonumber(seconds)
+    if roundedSeconds == nil or roundedSeconds < 0 then
+        return false
+    end
+    local flatKey = buildRouteTimeSettingKey(routeKey, vehicleType)
+    local normalizedSeconds = math.floor(roundedSeconds + 0.5)
+    if type(App.route_time_store) ~= "table" then
+        App.route_time_store = {}
+    end
+    App.route_time_store[flatKey] = normalizedSeconds
+    App.settings[flatKey] = normalizedSeconds
+    saveRouteTimeStore()
+    saveSettings()
+    return true
+end
+
+local function saveWidgetPosition(widget, xKey, yKey)
+    if widget == nil or App.settings == nil then
         return
     end
 
     local x = nil
     local y = nil
     pcall(function()
-        if button.GetOffset ~= nil then
-            x, y = button:GetOffset()
+        if widget.GetOffset ~= nil then
+            x, y = widget:GetOffset()
             return
         end
-        if button.GetEffectiveOffset ~= nil then
-            x, y = button:GetEffectiveOffset()
+        if widget.GetEffectiveOffset ~= nil then
+            x, y = widget:GetEffectiveOffset()
         end
     end)
 
@@ -669,9 +902,17 @@ local function saveButtonPosition(button)
         return
     end
 
-    App.settings.button_x = x
-    App.settings.button_y = y
+    App.settings[xKey] = x
+    App.settings[yKey] = y
     saveSettings()
+end
+
+local function saveButtonPosition(button)
+    saveWidgetPosition(button, "button_x", "button_y")
+end
+
+local function saveMainWindowPosition(window)
+    saveWidgetPosition(window, "trade_window_x", "trade_window_y")
 end
 
 local function enableDrag(widget, onStop)
@@ -702,7 +943,10 @@ local function enableDrag(widget, onStop)
 end
 
 local function loadSettings()
-    local settings = api.GetSettings(SETTINGS_ID)
+    local settings = readTableFile(SETTINGS_FILE_PATH)
+    if type(settings) ~= "table" then
+        settings = api.GetSettings(SETTINGS_ID)
+    end
     if type(settings) ~= "table" then
         settings = api.GetSettings("nuzi-trade")
     end
@@ -730,7 +974,23 @@ local function loadSettings()
     if trim(settings.manual_percent_text) == "" then
         settings.manual_percent_text = "130"
     end
+    if settings.timer_window_x == nil then
+        settings.timer_window_x = 72
+    end
+    if settings.timer_window_y == nil then
+        settings.timer_window_y = 320
+    end
+    if settings.trade_window_x == nil then
+        settings.trade_window_x = 120
+    end
+    if settings.trade_window_y == nil then
+        settings.trade_window_y = 120
+    end
+    settings.vehicle_type = VEHICLE_TYPES[getVehicleTypeIndex(settings.vehicle_type)]
     App.settings = settings
+    loadRouteTimeStore()
+    App.selected_vehicle_index = getVehicleTypeIndex(settings.vehicle_type)
+    App.route_timer.vehicle_type = settings.vehicle_type
 end
 
 local function ensurePriceIndex()
@@ -894,13 +1154,13 @@ local function buildRouteRows(originName, destinationName, percent)
             if percent ~= nil then
                 currentValue = (tonumber(row.max_price) or 0) * percent / MAX_ROUTE_PERCENT
             end
-            table.insert(routeRows, {
+            table.insert(routeRows, applyRouteTimingToRow({
                 pack_name = row.pack_name,
                 currency = row.currency,
                 max_price = row.max_price,
                 max_price_text = row.max_price_text,
                 current_price = currentValue
-            })
+            }, originName, canonicalDestination))
         end
     end
 
@@ -1136,6 +1396,141 @@ local function getSelectedPackFilter()
         return ""
     end
     return packName
+end
+
+local function getCurrentConcreteRouteInfo()
+    local origin = App.origins[App.selected_origin_index]
+    local destination = App.destinations[App.selected_destination_index]
+    local packName = getSelectedPackFilter()
+    local vehicleType = getSelectedVehicleType()
+    if origin == nil or destination == nil or packName == "" or isAllDestinationsEntry(destination) then
+        return nil
+    end
+
+    local destinationName = tostring(destination.static_name or destination.name or "")
+    local originName = tostring(origin.name or "")
+    local routeKey = buildRouteTimerKey(originName, destinationName, packName)
+    if routeKey == nil then
+        return nil
+    end
+
+    return {
+        origin_name = originName,
+        destination_name = destinationName,
+        pack_name = packName,
+        vehicle_type = vehicleType,
+        route_key = routeKey,
+        route_label = string.format("%s -> %s | %s [%s]", originName, destinationName, packName, vehicleType)
+    }
+end
+
+local function getRouteTimerElapsedMs()
+    local elapsedMs = tonumber(App.route_timer.elapsed_ms) or 0
+    if App.route_timer.running and (tonumber(App.route_timer.started_at_ms) or 0) > 0 then
+        elapsedMs = elapsedMs + math.max(0, getUiNowMs() - (tonumber(App.route_timer.started_at_ms) or 0))
+    end
+    return math.max(0, elapsedMs)
+end
+
+local function setRouteTimerStatus(text)
+    App.route_timer.status_text = tostring(text or "")
+end
+
+local function clearRouteTimerState()
+    App.route_timer.running = false
+    App.route_timer.started_at_ms = 0
+    App.route_timer.elapsed_ms = 0
+    App.route_timer.pending_save = false
+    App.route_timer.route_key = nil
+    App.route_timer.route_label = ""
+    App.route_timer.last_render_second = nil
+end
+
+local function startRouteTimer()
+    local routeInfo = getCurrentConcreteRouteInfo()
+    if routeInfo == nil then
+        setRouteTimerStatus("Select a specific destination and pack to start a route timer.")
+        refreshUi()
+        return
+    end
+
+    App.route_timer.running = true
+    App.route_timer.started_at_ms = getUiNowMs()
+    App.route_timer.elapsed_ms = 0
+    App.route_timer.pending_save = false
+    App.route_timer.route_key = routeInfo.route_key
+    App.route_timer.route_label = routeInfo.route_label
+    App.route_timer.vehicle_type = routeInfo.vehicle_type
+    App.route_timer.last_render_second = nil
+    setRouteTimerStatus("Timer running.")
+    refreshUi()
+end
+
+local function stopRouteTimer()
+    if not App.route_timer.running then
+        if App.route_timer.route_key == nil then
+            setRouteTimerStatus("Start a timer before stopping it.")
+        elseif App.route_timer.pending_save then
+            setRouteTimerStatus("Timer paused. Save to store this route time.")
+        else
+            setRouteTimerStatus("Timer stopped.")
+        end
+        refreshUi()
+        return
+    end
+
+    App.route_timer.elapsed_ms = getRouteTimerElapsedMs()
+    App.route_timer.running = false
+    App.route_timer.started_at_ms = 0
+    App.route_timer.pending_save = (tonumber(App.route_timer.elapsed_ms) or 0) > 0
+    App.route_timer.last_render_second = nil
+    setRouteTimerStatus("Timer paused. Save to store this route time.")
+    refreshUi()
+end
+
+local function saveRouteTimer()
+    if App.route_timer.running then
+        stopRouteTimer()
+    end
+
+    if App.route_timer.route_key == nil then
+        setRouteTimerStatus("Start a timer before saving it.")
+        refreshUi()
+        return
+    end
+
+    local elapsedMs = getRouteTimerElapsedMs()
+    if elapsedMs <= 0 then
+        setRouteTimerStatus("Timer has no elapsed time to save.")
+        refreshUi()
+        return
+    end
+
+    local elapsedSeconds = elapsedMs / 1000
+    local vehicleType = App.route_timer.vehicle_type or getSelectedVehicleType()
+    if setSavedRouteTimeSeconds(App.route_timer.route_key, vehicleType, elapsedSeconds) then
+        setRouteTimerStatus("Saved route time for " .. tostring(App.route_timer.route_label))
+        clearRouteTimerState()
+        if App.visible then
+            refreshSelectedRoute()
+        end
+    else
+        setRouteTimerStatus("Unable to save route time.")
+    end
+    refreshUi()
+end
+
+applyRouteTimingToRow = function(row, originName, destinationName)
+    if type(row) ~= "table" then
+        return row
+    end
+    local vehicleType = getSelectedVehicleType()
+    local routeKey = buildRouteTimerKey(originName, destinationName, row.pack_name)
+    row.route_time_key = routeKey
+    row.route_time_vehicle = vehicleType
+    row.route_time_seconds = getSavedRouteTimeSeconds(routeKey, vehicleType)
+    row.route_time_text = formatRouteDuration(row.route_time_seconds)
+    return row
 end
 
 local function syncOriginSelectionFromControl()
@@ -1462,14 +1857,14 @@ local function buildAllDestinationRouteRows(originName, percent, packName)
             rows = filterRouteRowsByPack(rows, selectedPack)
 
             for _, row in ipairs(rows) do
-                table.insert(routeRows, {
+                table.insert(routeRows, applyRouteTimingToRow({
                     destination_name = destinationName,
                     pack_name = row.pack_name,
                     currency = row.currency,
                     max_price = row.max_price,
                     max_price_text = row.max_price_text,
                     current_price = row.current_price
-                })
+                }, originName, destinationName))
             end
         end
     end
@@ -1588,6 +1983,21 @@ local function onDestinationSelected()
     refreshUi()
 end
 
+local function onVehicleSelected(vehicleType)
+    local idx = getVehicleTypeIndex(vehicleType)
+    if idx == nil or idx < 1 or idx > #VEHICLE_TYPES then
+        return
+    end
+    if idx == App.selected_vehicle_index then
+        return
+    end
+    App.selected_vehicle_index = idx
+    App.settings.vehicle_type = getSelectedVehicleType()
+    saveSettings()
+    refreshSelectedRoute()
+    refreshUi()
+end
+
 local function refreshAll(force)
     if not force and not App.visible then
         return
@@ -1642,12 +2052,47 @@ local function cyclePage(delta)
     end
 end
 
-local function refreshUi()
-    if App.ui.window == nil then
+refreshUi = function()
+    if App.ui.window == nil and App.ui.timer_window == nil then
         return
     end
 
-    if not App.visible then
+    local selectedVehicleType = getSelectedVehicleType()
+    local concreteRoute = getCurrentConcreteRouteInfo()
+    local timerValueText = formatRouteDuration(getRouteTimerElapsedMs() / 1000)
+    local timerRouteText = ""
+    local timerStatusText = tostring(App.route_timer.status_text or "")
+
+    if App.route_timer.route_key ~= nil then
+        timerRouteText = tostring(App.route_timer.route_label or "")
+    elseif concreteRoute ~= nil then
+        timerRouteText = concreteRoute.route_label
+        local savedSeconds = getSavedRouteTimeSeconds(concreteRoute.route_key, selectedVehicleType)
+        if savedSeconds ~= nil then
+            timerStatusText = string.format("Saved %s route time: %s", selectedVehicleType, formatRouteDuration(savedSeconds))
+            timerValueText = formatRouteDuration(savedSeconds)
+        elseif timerStatusText == "" then
+            timerStatusText = string.format("No saved %s route time for the selected route.", selectedVehicleType)
+        end
+    else
+        timerRouteText = "Choose a specific destination and pack to enable route timing."
+    end
+
+    if type(App.ui.controls.vehicle_buttons) == "table" then
+        for index, button in ipairs(App.ui.controls.vehicle_buttons) do
+            local label = VEHICLE_TYPES[index] or ""
+            if index == App.selected_vehicle_index then
+                label = "[" .. label .. "]"
+            end
+            safeSetText(button, label)
+        end
+    end
+    safeSetText(App.ui.controls.timer_value, timerValueText)
+    safeSetText(App.ui.controls.timer_route, timerRouteText)
+    safeSetText(App.ui.controls.timer_status, timerStatusText)
+    updateTimerWidgetVisibility()
+
+    if not App.visible or App.ui.window == nil then
         return
     end
 
@@ -1709,6 +2154,7 @@ local function refreshUi()
     safeSetText(App.ui.controls.currency_header, "Currency")
     safeSetText(App.ui.controls.cap_header, string.format("%s%%", tostring(App.current_percent or MAX_ROUTE_PERCENT)))
     safeSetText(App.ui.controls.live_header, "Live")
+    safeSetText(App.ui.controls.route_time_header, string.format("%s Time", selectedVehicleType))
 
     for index = 1, ROWS_PER_PAGE do
         local widgets = App.ui.rows[index]
@@ -1742,21 +2188,34 @@ local function refreshUi()
                     safeSetText(widgets.live, "-")
                     setLabelColor(widgets.live, { 180, 180, 180, 255 })
                 end
+                safeSetText(widgets.route_time, tostring(row.route_time_text or "-"))
                 safeShow(widgets.pack, true)
                 safeShow(widgets.currency, true)
                 safeShow(widgets.cap, true)
                 safeShow(widgets.live, true)
+                safeShow(widgets.route_time, true)
             else
                 safeSetText(widgets.pack, "")
                 safeSetText(widgets.currency, "")
                 safeSetText(widgets.cap, "")
                 safeSetText(widgets.live, "")
+                safeSetText(widgets.route_time, "")
                 safeShow(widgets.pack, false)
                 safeShow(widgets.currency, false)
                 safeShow(widgets.cap, false)
                 safeShow(widgets.live, false)
+                safeShow(widgets.route_time, false)
             end
         end
+    end
+end
+
+updateTimerWidgetVisibility = function()
+    local shouldShow = App.visible
+        or App.route_timer.running
+        or (App.route_timer.pending_save and App.route_timer.route_key ~= nil)
+    if App.ui.timer_window ~= nil then
+        safeShow(App.ui.timer_window, shouldShow)
     end
 end
 
@@ -1767,8 +2226,12 @@ local function closeWindow()
     App.closing_window = true
     App.visible = false
     if App.ui.window ~= nil then
+        saveMainWindowPosition(App.ui.window)
+    end
+    if App.ui.window ~= nil then
         safeShow(App.ui.window, false)
     end
+    updateTimerWidgetVisibility()
     App.closing_window = false
 end
 
@@ -1817,11 +2280,14 @@ local function createUi()
         return
     end
 
-    local window = api.Interface:CreateWindow("nuziTradeWindow", "Nuzi Trade", 640, 430)
+    local window = api.Interface:CreateWindow("nuziTradeWindow", "Nuzi Trade", 760, 430)
     if window == nil then
         return
     end
-    window:AddAnchor("CENTER", "UIParent", 0, 0)
+    window:AddAnchor("TOPLEFT", "UIParent", App.settings.trade_window_x, App.settings.trade_window_y)
+    enableDrag(window, function(self)
+        saveMainWindowPosition(self)
+    end)
     pcall(function()
         window:SetHandler("OnCloseByEsc", closeWindow)
     end)
@@ -1864,7 +2330,7 @@ local function createUi()
     createLabel("nuziTradeManualPercentLabel", window, "Live %", 18, 138, 54, 18, 13)
     App.ui.controls.percent_input = createEdit("nuziTradeManualPercent", window, App.settings.manual_percent_text or "130", 84, 132, 96, 8)
 
-    local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 506, 84, 116, 40)
+    local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 638, 84, 116, 40)
     if refreshButton ~= nil and refreshButton.SetHandler ~= nil then
         refreshButton:SetHandler("OnClick", function()
             refreshAll(true)
@@ -1872,16 +2338,16 @@ local function createUi()
         end)
     end
 
-    App.ui.controls.page_value = createLabel("nuziTradePageValue", window, "", 18, 170, 180, 18, 12)
+    App.ui.controls.page_value = createLabel("nuziTradePageValue", window, "", 18, 146, 180, 18, 12)
 
-    local prevButton = createButton("nuziTradePrevPage", window, "Prev Page", 438, 164, 88, 24)
+    local prevButton = createButton("nuziTradePrevPage", window, "Prev Page", 568, 140, 88, 24)
     if prevButton ~= nil and prevButton.SetHandler ~= nil then
         prevButton:SetHandler("OnClick", function()
             cyclePage(-1)
             refreshUi()
         end)
     end
-    local nextButton = createButton("nuziTradeNextPage", window, "Next Page", 534, 164, 88, 24)
+    local nextButton = createButton("nuziTradeNextPage", window, "Next Page", 664, 140, 88, 24)
     if nextButton ~= nil and nextButton.SetHandler ~= nil then
         nextButton:SetHandler("OnClick", function()
             cyclePage(1)
@@ -1889,20 +2355,62 @@ local function createUi()
         end)
     end
 
-    App.ui.controls.pack_header = createLabel("nuziTradePackHeader", window, "Pack", 18, 200, 290, 18, 12)
-    App.ui.controls.currency_header = createLabel("nuziTradeCurrencyHeader", window, "Currency", 330, 200, 120, 18, 12)
-    App.ui.controls.cap_header = createLabel("nuziTradeCapHeader", window, "130%", 470, 200, 50, 18, 12)
-    App.ui.controls.live_header = createLabel("nuziTradeLiveHeader", window, "Live", 544, 200, 60, 18, 12)
+    App.ui.controls.pack_header = createLabel("nuziTradePackHeader", window, "Pack", 18, 176, 290, 18, 12)
+    App.ui.controls.currency_header = createLabel("nuziTradeCurrencyHeader", window, "Currency", 330, 176, 120, 18, 12)
+    App.ui.controls.cap_header = createLabel("nuziTradeCapHeader", window, "130%", 470, 176, 50, 18, 12)
+    App.ui.controls.live_header = createLabel("nuziTradeLiveHeader", window, "Live", 544, 176, 60, 18, 12)
+    App.ui.controls.route_time_header = createLabel("nuziTradeRouteTimeHeader", window, "Route Time", 620, 176, 110, 18, 12)
 
     for index = 1, ROWS_PER_PAGE do
-        local y = 224 + ((index - 1) * 18)
+        local y = 200 + ((index - 1) * 18)
         App.ui.rows[index] = {
             pack = createLabel("nuziTradePackRow" .. tostring(index), window, "", 18, y, 300, 18, 12),
             currency = createLabel("nuziTradeCurrencyRow" .. tostring(index), window, "", 330, y, 120, 18, 12),
             cap = createLabel("nuziTradeCapRow" .. tostring(index), window, "", 470, y, 50, 18, 12),
-            live = createLabel("nuziTradeLiveRow" .. tostring(index), window, "", 544, y, 72, 18, 12)
+            live = createLabel("nuziTradeLiveRow" .. tostring(index), window, "", 544, y, 72, 18, 12),
+            route_time = createLabel("nuziTradeRouteTimeRow" .. tostring(index), window, "", 620, y, 108, 18, 12)
         }
         setLabelColor(App.ui.rows[index].cap, { 255, 226, 180, 255 })
+    end
+
+    local timerWindow = api.Interface:CreateWindow("nuziTradeTimerWindow", "Nuzi Trade Timer", 396, 148)
+    if timerWindow ~= nil then
+        timerWindow:AddAnchor("TOPLEFT", "UIParent", App.settings.timer_window_x, App.settings.timer_window_y)
+        enableDrag(timerWindow, function(self)
+            saveWidgetPosition(self, "timer_window_x", "timer_window_y")
+        end)
+
+        createLabel("nuziTradeTimerLabel", timerWindow, "Route Timer", 16, 40, 78, 18, 13)
+        App.ui.controls.timer_value = createLabel("nuziTradeTimerValue", timerWindow, "00:00", 98, 40, 74, 18, 13)
+        App.ui.controls.vehicle_buttons = {}
+        for index, vehicleType in ipairs(VEHICLE_TYPES) do
+            local x = 176 + ((index - 1) * 68)
+            local button = createButton("nuziTradeVehicle" .. tostring(index), timerWindow, vehicleType, x, 34, 64, 24)
+            if button ~= nil and button.SetHandler ~= nil then
+                button:SetHandler("OnClick", function()
+                    onVehicleSelected(vehicleType)
+                end)
+            end
+            App.ui.controls.vehicle_buttons[index] = button
+        end
+
+        local startTimerButton = createButton("nuziTradeTimerStart", timerWindow, "Start", 16, 72, 68, 24)
+        if startTimerButton ~= nil and startTimerButton.SetHandler ~= nil then
+            startTimerButton:SetHandler("OnClick", startRouteTimer)
+        end
+        local stopTimerButton = createButton("nuziTradeTimerStop", timerWindow, "Stop", 92, 72, 68, 24)
+        if stopTimerButton ~= nil and stopTimerButton.SetHandler ~= nil then
+            stopTimerButton:SetHandler("OnClick", stopRouteTimer)
+        end
+        local saveTimerButton = createButton("nuziTradeTimerSave", timerWindow, "Save", 168, 72, 68, 24)
+        if saveTimerButton ~= nil and saveTimerButton.SetHandler ~= nil then
+            saveTimerButton:SetHandler("OnClick", saveRouteTimer)
+        end
+
+        App.ui.controls.timer_route = createLabel("nuziTradeTimerRoute", timerWindow, "", 16, 104, 360, 18, 12)
+        App.ui.controls.timer_status = createLabel("nuziTradeTimerStatus", timerWindow, "", 16, 122, 360, 18, 12)
+        App.ui.timer_window = timerWindow
+        safeShow(timerWindow, false)
     end
 
     safeShow(window, false)
@@ -1920,9 +2428,15 @@ local function unloadUi()
                 api.Interface:Free(App.ui.window)
             end)
         end
+        if App.ui.timer_window ~= nil then
+            pcall(function()
+                api.Interface:Free(App.ui.timer_window)
+            end)
+        end
     end
     App.ui.button = nil
     App.ui.window = nil
+    App.ui.timer_window = nil
     App.ui.controls = {}
     App.ui.rows = {}
 end
@@ -1932,13 +2446,21 @@ local function onUpdate(dt)
         return
     end
 
-    if not App.visible then
+    if not App.visible and not App.route_timer.running then
         return
     end
 
-    if App.ui.window ~= nil and not isWidgetVisible(App.ui.window) then
+    if App.visible and App.ui.window ~= nil and not isWidgetVisible(App.ui.window) then
         closeWindow()
         return
+    end
+
+    if App.route_timer.running then
+        local elapsedSeconds = math.floor(getRouteTimerElapsedMs() / 1000)
+        if elapsedSeconds ~= App.route_timer.last_render_second then
+            App.route_timer.last_render_second = elapsedSeconds
+            refreshUi()
+        end
     end
 end
 
