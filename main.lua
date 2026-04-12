@@ -18,8 +18,10 @@ local addon = {
 }
 
 local SETTINGS_ID = "nuzi_trade"
-local SETTINGS_FILE_PATH = "nuzi-trade/settings.txt"
-local ROUTE_TIMES_FILE_PATH = "nuzi-trade/route_times.txt"
+local SETTINGS_FILE_PATH = "nuzi-trade/.data/settings.txt"
+local LEGACY_SETTINGS_FILE_PATH = "nuzi-trade/settings.txt"
+local ROUTE_TIMES_FILE_PATH = "nuzi-trade/.data/route_times.txt"
+local LEGACY_ROUTE_TIMES_FILE_PATH = "nuzi-trade/route_times.txt"
 local MAX_ROUTE_PERCENT = 130
 local ROWS_PER_PAGE = 10
 local ALL_PACKS_LABEL = "All Packs"
@@ -768,6 +770,9 @@ end
 local function loadRouteTimeStore()
     local routeTimes = readTableFile(ROUTE_TIMES_FILE_PATH)
     if type(routeTimes) ~= "table" then
+        routeTimes = readTableFile(LEGACY_ROUTE_TIMES_FILE_PATH)
+    end
+    if type(routeTimes) ~= "table" then
         routeTimes = {}
     end
 
@@ -944,6 +949,9 @@ end
 
 local function loadSettings()
     local settings = readTableFile(SETTINGS_FILE_PATH)
+    if type(settings) ~= "table" then
+        settings = readTableFile(LEGACY_SETTINGS_FILE_PATH)
+    end
     if type(settings) ~= "table" then
         settings = api.GetSettings(SETTINGS_ID)
     end
