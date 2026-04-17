@@ -1,14 +1,14 @@
 local api = require("api")
+local Core = api._NuziCore or require("nuzi-core/core")
 
-local function loadModule(candidates)
-    for _, name in ipairs(candidates or {}) do
-        local ok, mod = pcall(require, name)
-        if ok and type(mod) == "table" then
-            return mod
-        end
-    end
-    return nil
-end
+local Events = Core.Events
+local Log = Core.Log
+local Require = Core.Require
+local Settings = Core.Settings
+local ZoneStateModule = Require.Try({
+    "nuzi-trade/zone_state",
+    "nuzi-trade.zone_state"
+})
 
 local addon = {
     name = "Nuzi Trade",
@@ -27,6 +27,27 @@ local ROWS_PER_PAGE = 10
 local ALL_PACKS_LABEL = "All Packs"
 local ALL_DESTINATIONS_LABEL = "All Destinations"
 local VEHICLE_TYPES = { "Hauler", "Car", "Boat" }
+local ZONE_STATE_REFRESH_INTERVAL_MS = 5000
+local ZONE_STATE_COLORS = {
+    peace = { 120, 220, 140, 255 },
+    conflict = { 255, 208, 96, 255 },
+    war = { 255, 122, 122, 255 },
+    static = { 148, 190, 236, 255 },
+    unknown = { 186, 186, 186, 255 }
+}
+local DEFAULT_SETTINGS = {
+    button_x = 16,
+    button_y = 240,
+    origin_name = "",
+    destination_name = "",
+    pack_name = "",
+    manual_percent_text = "130",
+    timer_window_x = 72,
+    timer_window_y = 320,
+    trade_window_x = 120,
+    trade_window_y = 120,
+    vehicle_type = VEHICLE_TYPES[1]
+}
 
 local STRIP_SUFFIXES = {
     peninsula = true,
@@ -157,6 +178,11 @@ local App = {
     needs_refresh = true,
     closing_window = false,
     syncing_combo = false,
+    live_origin_name = nil,
+    live_origin_id = nil,
+    live_destinations = {},
+    zone_state_cache = {},
+    zone_state_last_refresh_ms = 0,
     route_time_store = {},
     route_timer = {
         running = false,
@@ -178,32 +204,19 @@ local App = {
     }
 }
 
+local logger = Log.Create(addon.name)
+local events = Events.Create({
+    logger = logger
+})
+
 local refreshUi
 local applyRouteTimingToRow
 local updateTimerWidgetVisibility
-
-local function readTableFile(path)
-    if api.File == nil or api.File.Read == nil then
-        return nil
-    end
-    local ok, value = pcall(function()
-        return api.File:Read(path)
-    end)
-    if ok and type(value) == "table" then
-        return value
-    end
-    return nil
-end
-
-local function writeTableFile(path, value)
-    if api.File == nil or api.File.Write == nil or type(value) ~= "table" then
-        return false
-    end
-    local ok = pcall(function()
-        api.File:Write(path, value)
-    end)
-    return ok
-end
+local refreshZoneStateData
+local buildDestinationStateSummary
+local buildOriginStateSummary
+local ensureZoneState
+local resolveLiveCatalogForOrigin
 
 local function trim(value)
     return (tostring(value or ""):gsub("^%s*(.-)%s*$", "%1"))
@@ -322,6 +335,77 @@ end
 local function getSelectedVehicleType()
     return VEHICLE_TYPES[App.selected_vehicle_index] or VEHICLE_TYPES[1]
 end
+
+local function normalizeSettingsValue(settings)
+    if type(settings) ~= "table" then
+        return false
+    end
+
+    local changed = false
+
+    local function ensureDefault(key, value)
+        if settings[key] == nil then
+            settings[key] = value
+            changed = true
+        end
+    end
+
+    for key, value in pairs(DEFAULT_SETTINGS) do
+        ensureDefault(key, value)
+    end
+
+    local percentText = trim(settings.manual_percent_text)
+    if percentText == "" then
+        percentText = DEFAULT_SETTINGS.manual_percent_text
+    end
+    if settings.manual_percent_text ~= percentText then
+        settings.manual_percent_text = percentText
+        changed = true
+    end
+
+    local vehicleType = VEHICLE_TYPES[getVehicleTypeIndex(settings.vehicle_type)]
+    if settings.vehicle_type ~= vehicleType then
+        settings.vehicle_type = vehicleType
+        changed = true
+    end
+
+    return changed
+end
+
+local settingsStore = Settings.CreateStore({
+    addon_id = SETTINGS_ID,
+    legacy_addon_ids = {
+        "nuzi-trade"
+    },
+    settings_file_path = SETTINGS_FILE_PATH,
+    legacy_settings_file_path = LEGACY_SETTINGS_FILE_PATH,
+    defaults = DEFAULT_SETTINGS,
+    read_mode = "serialized_then_flat",
+    write_mode = "serialized_then_flat",
+    read_raw_text_fallback = true,
+    write_mirror_paths = {
+        LEGACY_SETTINGS_FILE_PATH
+    },
+    log_name = addon.name,
+    normalize = function(settings)
+        return normalizeSettingsValue(settings)
+    end
+})
+
+local routeTimeStore = Settings.CreateStore({
+    settings_file_path = ROUTE_TIMES_FILE_PATH,
+    legacy_settings_file_path = LEGACY_ROUTE_TIMES_FILE_PATH,
+    defaults = {},
+    read_mode = "serialized_then_flat",
+    write_mode = "serialized_then_flat",
+    read_raw_text_fallback = true,
+    write_mirror_paths = {
+        LEGACY_ROUTE_TIMES_FILE_PATH
+    },
+    use_api_settings = false,
+    save_global_settings = false,
+    log_name = addon.name .. " Route Times"
+})
 
 local function buildRouteTimeSettingKey(routeKey, vehicleType)
     local routePart = normalizeKey(routeKey):gsub("%s+", "_")
@@ -697,9 +781,7 @@ local function getEditText(ctrl)
 end
 
 local function logInfo(message)
-    pcall(function()
-        api.Log:Info("[Nuzi Trade] " .. tostring(message))
-    end)
+    logger:Info(tostring(message))
 end
 
 local function loadPriceRows()
@@ -716,7 +798,7 @@ local function loadPriceRows()
     end
 
     if rows == nil then
-        rows = loadModule({
+        rows = Require.Try({
             "nuzi-trade/trade_pack_prices",
             "nuzi-trade.trade_pack_prices",
             "trade_pack_prices"
@@ -754,28 +836,25 @@ local function saveSettings()
     if App.settings == nil then
         return
     end
-    writeTableFile(SETTINGS_FILE_PATH, App.settings)
-    pcall(function()
-        api.SaveSettings()
-    end)
+    settingsStore.settings = App.settings
+    settingsStore:Save()
 end
 
 local function saveRouteTimeStore()
     if type(App.route_time_store) ~= "table" then
         App.route_time_store = {}
     end
-    writeTableFile(ROUTE_TIMES_FILE_PATH, App.route_time_store)
+    routeTimeStore.settings = App.route_time_store
+    routeTimeStore:Save()
 end
 
 local function loadRouteTimeStore()
-    local routeTimes = readTableFile(ROUTE_TIMES_FILE_PATH)
-    if type(routeTimes) ~= "table" then
-        routeTimes = readTableFile(LEGACY_ROUTE_TIMES_FILE_PATH)
-    end
+    local routeTimes, meta = routeTimeStore:Load()
     if type(routeTimes) ~= "table" then
         routeTimes = {}
     end
 
+    local migrated = type(meta) == "table" and meta.migrated == true
     if type(App.settings) == "table" then
         for key, value in pairs(App.settings) do
             local keyText = tostring(key or "")
@@ -820,6 +899,10 @@ local function loadRouteTimeStore()
     end
 
     App.route_time_store = routeTimes
+    routeTimeStore.settings = routeTimes
+    if migrated then
+        saveRouteTimeStore()
+    end
 end
 
 local function getSavedRouteTimeSeconds(routeKey, vehicleType)
@@ -948,54 +1031,9 @@ local function enableDrag(widget, onStop)
 end
 
 local function loadSettings()
-    local settings = readTableFile(SETTINGS_FILE_PATH)
-    if type(settings) ~= "table" then
-        settings = readTableFile(LEGACY_SETTINGS_FILE_PATH)
-    end
-    if type(settings) ~= "table" then
-        settings = api.GetSettings(SETTINGS_ID)
-    end
-    if type(settings) ~= "table" then
-        settings = api.GetSettings("nuzi-trade")
-    end
-    if type(settings) ~= "table" then
-        settings = {}
-    end
-    if settings.button_x == nil then
-        settings.button_x = 16
-    end
-    if settings.button_y == nil then
-        settings.button_y = 240
-    end
-    if settings.origin_name == nil then
-        settings.origin_name = ""
-    end
-    if settings.destination_name == nil then
-        settings.destination_name = ""
-    end
-    if settings.pack_name == nil then
-        settings.pack_name = ""
-    end
-    if settings.manual_percent_text == nil then
-        settings.manual_percent_text = "130"
-    end
-    if trim(settings.manual_percent_text) == "" then
-        settings.manual_percent_text = "130"
-    end
-    if settings.timer_window_x == nil then
-        settings.timer_window_x = 72
-    end
-    if settings.timer_window_y == nil then
-        settings.timer_window_y = 320
-    end
-    if settings.trade_window_x == nil then
-        settings.trade_window_x = 120
-    end
-    if settings.trade_window_y == nil then
-        settings.trade_window_y = 120
-    end
-    settings.vehicle_type = VEHICLE_TYPES[getVehicleTypeIndex(settings.vehicle_type)]
+    local settings = settingsStore:Load()
     App.settings = settings
+    settingsStore.settings = settings
     loadRouteTimeStore()
     App.selected_vehicle_index = getVehicleTypeIndex(settings.vehicle_type)
     App.route_timer.vehicle_type = settings.vehicle_type
@@ -1073,6 +1111,63 @@ local function findStaticDestinationName(name)
     end
 
     return nil
+end
+
+ensureZoneState = function()
+    if ZoneStateModule == nil then
+        return nil
+    end
+    if App.zone_state_manager == nil then
+        App.zone_state_manager = ZoneStateModule.Create({
+            app = App,
+            colors = ZONE_STATE_COLORS,
+            refresh_interval_ms = ZONE_STATE_REFRESH_INTERVAL_MS,
+            trim = trim,
+            normalize_key = normalizeKey,
+            get_ui_now_ms = getUiNowMs,
+            find_static_destination_name = findStaticDestinationName,
+            is_all_destinations_entry = isAllDestinationsEntry
+        })
+    end
+    return App.zone_state_manager
+end
+
+local function applyDestinationZoneState(entry, force)
+    local manager = ensureZoneState()
+    if manager == nil then
+        return entry
+    end
+    return manager:ApplyDestinationState(entry, force)
+end
+
+buildDestinationStateSummary = function(destination)
+    local manager = ensureZoneState()
+    if manager == nil then
+        return "", ZONE_STATE_COLORS.unknown
+    end
+    return manager:BuildDestinationSummary(destination)
+end
+
+buildOriginStateSummary = function(origin)
+    local manager = ensureZoneState()
+    if manager == nil then
+        return "", ZONE_STATE_COLORS.unknown
+    end
+    return manager:BuildOriginSummary(origin, App.live_origin_id, App.live_origin_name)
+end
+
+refreshZoneStateData = function(force)
+    local origin = App.origins[App.selected_origin_index]
+    if origin == nil then
+        return
+    end
+
+    resolveLiveCatalogForOrigin(origin.name)
+    for _, entry in ipairs(App.destinations or {}) do
+        applyDestinationZoneState(entry, force)
+    end
+
+    App.zone_state_last_refresh_ms = getUiNowMs()
 end
 
 local function buildOriginPatterns(name)
@@ -1728,13 +1823,13 @@ local function buildStaticDestinationEntries(originName)
             local rows = buildRouteRows(originName, canonicalName, nil)
             if #rows > 0 then
                 totalRowCount = totalRowCount + #rows
-                table.insert(destinations, {
+                table.insert(destinations, applyDestinationZoneState({
                     id = nil,
                     name = canonicalName,
                     static_name = canonicalName,
                     percent = nil,
                     row_count = #rows
-                })
+                }, false))
             end
         end
     end
@@ -1757,7 +1852,7 @@ local function buildStaticDestinationEntries(originName)
     return destinations
 end
 
-local function resolveLiveCatalogForOrigin(originName)
+resolveLiveCatalogForOrigin = function(originName)
     App.live_origin_name = nil
     App.live_origin_id = nil
     App.live_destinations = {}
@@ -1779,7 +1874,7 @@ local function resolveLiveCatalogForOrigin(originName)
         return
     end
 
-    App.live_origin_name = originName
+    App.live_origin_name = tostring(liveOrigin.name or originName)
     App.live_origin_id = liveOrigin.id
 
     local rawDestinations = callStore("GetSellableZoneGroups", liveOrigin.id)
@@ -1810,8 +1905,10 @@ local function refreshDestinationsForSelectedOrigin(preferredName)
         return
     end
 
+    resolveLiveCatalogForOrigin(origin.name)
     local destinations = buildStaticDestinationEntries(origin.name)
     App.destinations = destinations
+    App.zone_state_last_refresh_ms = getUiNowMs()
 
     local preferred = trim(preferredName)
     if preferred == "" then
@@ -1946,8 +2043,8 @@ local function onOriginSelected()
     saveSettings()
     refreshPacksForSelectedOrigin("")
     refreshDestinationsForSelectedOrigin("")
-    clearDisplayedRoute()
-    App.needs_refresh = true
+    refreshSelectedRoute()
+    App.needs_refresh = false
     refreshUi()
 end
 
@@ -1966,8 +2063,8 @@ local function onPackSelected()
     App.route_page_index = 1
     App.settings.pack_name = getSelectedPackFilter()
     saveSettings()
-    clearDisplayedRoute()
-    App.needs_refresh = true
+    refreshSelectedRoute()
+    App.needs_refresh = false
     refreshUi()
 end
 
@@ -1986,8 +2083,8 @@ local function onDestinationSelected()
     App.route_page_index = 1
     App.settings.destination_name = getSelectedDestinationName()
     saveSettings()
-    clearDisplayedRoute()
-    App.needs_refresh = true
+    refreshSelectedRoute()
+    App.needs_refresh = false
     refreshUi()
 end
 
@@ -2112,9 +2209,12 @@ refreshUi = function()
     local destinationIndexText = destinationTotal > 0 and tostring(App.selected_destination_index) or "0"
     local pageCount = math.max(1, math.ceil(#App.route_rows / ROWS_PER_PAGE))
     local rowStart = ((App.route_page_index - 1) * ROWS_PER_PAGE) + 1
+    local selectedOrigin = App.origins[App.selected_origin_index]
     local selectedDestination = App.destinations[App.selected_destination_index]
     local allDestinationsMode = isAllDestinationsEntry(selectedDestination)
     local selectedPack = getSelectedPackFilter()
+    local originStateText, originStateColor = buildOriginStateSummary(selectedOrigin)
+    local destinationStateText, destinationStateColor = buildDestinationStateSummary(selectedDestination)
 
     local originItems = {}
     for _, entry in ipairs(App.origins or {}) do
@@ -2157,6 +2257,10 @@ refreshUi = function()
     safeSetText(App.ui.controls.origin_meta, string.format("%s / %d", originIndexText, originTotal))
     safeSetText(App.ui.controls.pack_meta, string.format("%s / %d", packIndexText, packTotal))
     safeSetText(App.ui.controls.destination_meta, string.format("%s / %d", destinationIndexText, destinationTotal))
+    safeSetText(App.ui.controls.origin_state, originStateText)
+    setLabelColor(App.ui.controls.origin_state, originStateColor)
+    safeSetText(App.ui.controls.destination_state, destinationStateText)
+    setLabelColor(App.ui.controls.destination_state, destinationStateColor)
     safeSetText(App.ui.controls.page_value, string.format("Page %d / %d", App.route_page_index, pageCount))
     safeSetText(App.ui.controls.pack_header, allDestinationsMode and (selectedPack ~= "" and "Destination" or "Destination / Pack") or "Pack")
     safeSetText(App.ui.controls.currency_header, "Currency")
@@ -2252,7 +2356,7 @@ local function openWindow()
     refreshOriginCatalog(App.settings.origin_name)
     refreshPacksForSelectedOrigin(App.settings.pack_name)
     refreshDestinationsForSelectedOrigin(App.settings.destination_name)
-    clearDisplayedRoute()
+    refreshSelectedRoute()
     safeSetText(App.ui.controls.percent_input, App.settings.manual_percent_text or "130")
     refreshUi()
 end
@@ -2288,7 +2392,7 @@ local function createUi()
         return
     end
 
-    local window = api.Interface:CreateWindow("nuziTradeWindow", "Nuzi Trade", 760, 430)
+    local window = api.Interface:CreateWindow("nuziTradeWindow", "Nuzi Trade", 860, 430)
     if window == nil then
         return
     end
@@ -2311,6 +2415,7 @@ local function createUi()
     createLabel("nuziTradeOriginLabel", window, "Origin", 18, 42, 54, 18, 13)
     App.ui.controls.origin_combo = createComboBox(window, 84, 36, 340, { "Loading..." })
     App.ui.controls.origin_meta = createLabel("nuziTradeOriginMeta", window, "", 432, 42, 56, 18, 12)
+    App.ui.controls.origin_state = createLabel("nuziTradeOriginState", window, "", 496, 42, 228, 18, 12)
     if App.ui.controls.origin_combo ~= nil then
         pcall(function()
             App.ui.controls.origin_combo:SetHandler("OnSelChanged", onOriginSelected)
@@ -2329,6 +2434,7 @@ local function createUi()
     createLabel("nuziTradeDestinationLabel", window, "Destination", 18, 106, 70, 18, 13)
     App.ui.controls.destination_combo = createComboBox(window, 84, 100, 340, { "Loading..." })
     App.ui.controls.destination_meta = createLabel("nuziTradeDestinationMeta", window, "", 432, 106, 56, 18, 12)
+    App.ui.controls.destination_state = createLabel("nuziTradeDestinationState", window, "", 496, 106, 228, 18, 12)
     if App.ui.controls.destination_combo ~= nil then
         pcall(function()
             App.ui.controls.destination_combo:SetHandler("OnSelChanged", onDestinationSelected)
@@ -2338,7 +2444,7 @@ local function createUi()
     createLabel("nuziTradeManualPercentLabel", window, "Live %", 18, 138, 54, 18, 13)
     App.ui.controls.percent_input = createEdit("nuziTradeManualPercent", window, App.settings.manual_percent_text or "130", 84, 132, 96, 8)
 
-    local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 638, 84, 116, 40)
+    local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 736, 84, 104, 40)
     if refreshButton ~= nil and refreshButton.SetHandler ~= nil then
         refreshButton:SetHandler("OnClick", function()
             refreshAll(true)
@@ -2363,20 +2469,20 @@ local function createUi()
         end)
     end
 
-    App.ui.controls.pack_header = createLabel("nuziTradePackHeader", window, "Pack", 18, 176, 290, 18, 12)
-    App.ui.controls.currency_header = createLabel("nuziTradeCurrencyHeader", window, "Currency", 330, 176, 120, 18, 12)
-    App.ui.controls.cap_header = createLabel("nuziTradeCapHeader", window, "130%", 470, 176, 50, 18, 12)
-    App.ui.controls.live_header = createLabel("nuziTradeLiveHeader", window, "Live", 544, 176, 60, 18, 12)
-    App.ui.controls.route_time_header = createLabel("nuziTradeRouteTimeHeader", window, "Route Time", 620, 176, 110, 18, 12)
+    App.ui.controls.pack_header = createLabel("nuziTradePackHeader", window, "Pack", 18, 176, 274, 18, 12)
+    App.ui.controls.currency_header = createLabel("nuziTradeCurrencyHeader", window, "Currency", 306, 176, 110, 18, 12)
+    App.ui.controls.cap_header = createLabel("nuziTradeCapHeader", window, "130%", 426, 176, 64, 18, 12)
+    App.ui.controls.live_header = createLabel("nuziTradeLiveHeader", window, "Live", 504, 176, 72, 18, 12)
+    App.ui.controls.route_time_header = createLabel("nuziTradeRouteTimeHeader", window, "Route Time", 592, 176, 140, 18, 12)
 
     for index = 1, ROWS_PER_PAGE do
         local y = 200 + ((index - 1) * 18)
         App.ui.rows[index] = {
-            pack = createLabel("nuziTradePackRow" .. tostring(index), window, "", 18, y, 300, 18, 12),
-            currency = createLabel("nuziTradeCurrencyRow" .. tostring(index), window, "", 330, y, 120, 18, 12),
-            cap = createLabel("nuziTradeCapRow" .. tostring(index), window, "", 470, y, 50, 18, 12),
-            live = createLabel("nuziTradeLiveRow" .. tostring(index), window, "", 544, y, 72, 18, 12),
-            route_time = createLabel("nuziTradeRouteTimeRow" .. tostring(index), window, "", 620, y, 108, 18, 12)
+            pack = createLabel("nuziTradePackRow" .. tostring(index), window, "", 18, y, 278, 18, 12),
+            currency = createLabel("nuziTradeCurrencyRow" .. tostring(index), window, "", 306, y, 110, 18, 12),
+            cap = createLabel("nuziTradeCapRow" .. tostring(index), window, "", 426, y, 64, 18, 12),
+            live = createLabel("nuziTradeLiveRow" .. tostring(index), window, "", 504, y, 72, 18, 12),
+            route_time = createLabel("nuziTradeRouteTimeRow" .. tostring(index), window, "", 592, y, 140, 18, 12)
         }
         setLabelColor(App.ui.rows[index].cap, { 255, 226, 180, 255 })
     end
@@ -2463,6 +2569,14 @@ local function onUpdate(dt)
         return
     end
 
+    if App.visible then
+        local now = getUiNowMs()
+        if (now - (tonumber(App.zone_state_last_refresh_ms) or 0)) >= ZONE_STATE_REFRESH_INTERVAL_MS then
+            refreshZoneStateData(true)
+            refreshUi()
+        end
+    end
+
     if App.route_timer.running then
         local elapsedSeconds = math.floor(getRouteTimerElapsedMs() / 1000)
         if elapsedSeconds ~= App.route_timer.last_render_second then
@@ -2488,8 +2602,8 @@ function addon.OnLoad()
     App.loaded = true
     App.visible = false
     closeWindow()
-    api.On("UPDATE", onUpdate)
-    api.On("UI_RELOADED", onUiReloaded)
+    events:OnSafe("UPDATE", "UPDATE", onUpdate)
+    events:OnSafe("UI_RELOADED", "UI_RELOADED", onUiReloaded)
     logInfo("Loaded v" .. tostring(addon.version))
 end
 
@@ -2497,10 +2611,7 @@ function addon.OnUnload()
     App.loaded = false
     App.visible = false
     unloadUi()
-    api.On("UPDATE", function()
-    end)
-    api.On("UI_RELOADED", function()
-    end)
+    events:ClearAll()
 end
 
 addon.OnSettingToggle = function()
