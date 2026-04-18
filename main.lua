@@ -5,15 +5,21 @@ local Events = Core.Events
 local Log = Core.Log
 local Require = Core.Require
 local Settings = Core.Settings
+local CreateNuziSlider = nil
 local ZoneStateModule = Require.Try({
     "nuzi-trade/zone_state",
     "nuzi-trade.zone_state"
 })
+local detectedAddonDir = nil
+
+pcall(function()
+    CreateNuziSlider = require("nuzi-core/ui/slider")
+end)
 
 local addon = {
     name = "Nuzi Trade",
     author = "Nuzi",
-    version = "0.2.5",
+    version = "1.0.0",
     desc = "Trade pack values"
 }
 
@@ -23,11 +29,14 @@ local LEGACY_SETTINGS_FILE_PATH = "nuzi-trade/settings.txt"
 local ROUTE_TIMES_FILE_PATH = "nuzi-trade/.data/route_times.txt"
 local LEGACY_ROUTE_TIMES_FILE_PATH = "nuzi-trade/route_times.txt"
 local MAX_ROUTE_PERCENT = 130
+local LAUNCHER_BUTTON_MIN_SIZE = 32
+local LAUNCHER_BUTTON_MAX_SIZE = 96
 local ROWS_PER_PAGE = 10
 local ALL_PACKS_LABEL = "All Packs"
 local ALL_DESTINATIONS_LABEL = "All Destinations"
 local VEHICLE_TYPES = { "Hauler", "Car", "Boat" }
 local ZONE_STATE_REFRESH_INTERVAL_MS = 5000
+local ZONE_WATCH_CATALOG_REFRESH_INTERVAL_MS = 60000
 local ZONE_STATE_COLORS = {
     peace = { 120, 220, 140, 255 },
     conflict = { 255, 208, 96, 255 },
@@ -35,9 +44,34 @@ local ZONE_STATE_COLORS = {
     static = { 148, 190, 236, 255 },
     unknown = { 186, 186, 186, 255 }
 }
+local ZONE_WINDOW_SECTION_COLOR = { 176, 208, 255, 255 }
+local ZONE_WINDOW_NAME_COLOR = { 232, 232, 232, 255 }
+local LABEL_OUTLINE_COLOR = { 0, 0, 0, 255 }
+local ZONE_WATCH_LAYOUT = {
+    { kind = "zone", name = "Diamond Shores" },
+    { kind = "section", title = "Nuia" },
+    { kind = "zone", name = "Cinderstone Moor" },
+    { kind = "zone", name = "Halcyona" },
+    { kind = "zone", name = "Hellswamp" },
+    { kind = "zone", name = "Karkasse Ridgelands" },
+    { kind = "zone", name = "Sanddeep" },
+    { kind = "section", title = "Haranya" },
+    { kind = "zone", name = "Hasla" },
+    { kind = "zone", name = "Perinoor Ruins" },
+    { kind = "zone", name = "Rookborne Basin" },
+    { kind = "zone", name = "Windscour Savannah" },
+    { kind = "zone", name = "Ynystere" }
+}
+local ZONE_WATCH_ZONES = {}
+for _, entry in ipairs(ZONE_WATCH_LAYOUT) do
+    if entry.kind == "zone" then
+        table.insert(ZONE_WATCH_ZONES, entry.name)
+    end
+end
 local DEFAULT_SETTINGS = {
     button_x = 16,
     button_y = 240,
+    button_size = 44,
     origin_name = "",
     destination_name = "",
     pack_name = "",
@@ -46,8 +80,90 @@ local DEFAULT_SETTINGS = {
     timer_window_y = 320,
     trade_window_x = 120,
     trade_window_y = 120,
+    zone_window_x = 1000,
+    zone_window_y = 120,
     vehicle_type = VEHICLE_TYPES[1]
 }
+
+local function normalizePath(path)
+    return string.gsub(tostring(path or ""), "\\", "/")
+end
+
+local function fileExists(path)
+    if type(io) ~= "table" or type(io.open) ~= "function" then
+        return false
+    end
+    local file = nil
+    local ok = pcall(function()
+        file = io.open(path, "rb")
+    end)
+    if ok and file ~= nil then
+        pcall(function()
+            file:close()
+        end)
+        return true
+    end
+    return false
+end
+
+local function addonDir()
+    if detectedAddonDir ~= nil then
+        return detectedAddonDir or nil
+    end
+    detectedAddonDir = false
+    if type(debug) == "table" and type(debug.getinfo) == "function" then
+        local info = debug.getinfo(1, "S")
+        local source = type(info) == "table" and tostring(info.source or "") or ""
+        if string.sub(source, 1, 1) == "@" then
+            source = normalizePath(string.sub(source, 2))
+            local folder = string.match(source, "^(.*)/[^/]+$")
+            if type(folder) == "string" and folder ~= "" then
+                detectedAddonDir = folder
+                return folder
+            end
+        end
+    end
+    return nil
+end
+
+local function resolveAssetPath(relativePath)
+    local rawRelative = normalizePath(relativePath)
+    local strippedRelative = string.match(rawRelative, "^[^/]+/(.+)$") or rawRelative
+    local candidates = {}
+    local seen = {}
+
+    local function addCandidate(path)
+        path = normalizePath(path)
+        if path == "" or seen[path] then
+            return
+        end
+        seen[path] = true
+        table.insert(candidates, path)
+    end
+
+    local folder = addonDir()
+    if folder ~= nil then
+        addCandidate(folder .. "/" .. strippedRelative)
+        addCandidate(folder .. "/" .. rawRelative)
+    end
+
+    local baseDir = normalizePath(type(api) == "table" and type(api.baseDir) == "string" and api.baseDir or "")
+    if baseDir ~= "" then
+        addCandidate(baseDir .. "/" .. rawRelative)
+        addCandidate(baseDir .. "/" .. strippedRelative)
+    end
+
+    addCandidate(rawRelative)
+    addCandidate(strippedRelative)
+
+    for _, candidate in ipairs(candidates) do
+        if fileExists(candidate) then
+            return candidate
+        end
+    end
+
+    return candidates[1] or rawRelative
+end
 
 local STRIP_SUFFIXES = {
     peninsula = true,
@@ -178,6 +294,15 @@ local App = {
     needs_refresh = true,
     closing_window = false,
     syncing_combo = false,
+    syncing_launcher_slider = false,
+    zone_window_visible = false,
+    zone_watch_rows = {},
+    zone_watch_last_refresh_ms = 0,
+    zone_watch_countdown_started_ms = 0,
+    zone_watch_last_render_second = nil,
+    zone_watch_catalog = {},
+    zone_watch_catalog_refreshed_at_ms = 0,
+    zone_watch_state_cache = {},
     live_origin_name = nil,
     live_origin_id = nil,
     live_destinations = {},
@@ -199,8 +324,10 @@ local App = {
         button = nil,
         window = nil,
         timer_window = nil,
+        zone_window = nil,
         controls = {},
-        rows = {}
+        rows = {},
+        zone_rows = {}
     }
 }
 
@@ -212,11 +339,18 @@ local events = Events.Create({
 local refreshUi
 local applyRouteTimingToRow
 local updateTimerWidgetVisibility
-local refreshZoneStateData
-local buildDestinationStateSummary
-local buildOriginStateSummary
 local ensureZoneState
 local resolveLiveCatalogForOrigin
+local callStore
+local collectZoneEntries
+local dedupeEntries
+local destinationNamesMatch
+local reloadZoneStateModule
+local buildZoneWatchRowsFallback
+local refreshZoneWatchRows
+local updateZoneWindowVisibility
+local saveSettings
+local toggleZoneWindow
 
 local function trim(value)
     return (tostring(value or ""):gsub("^%s*(.-)%s*$", "%1"))
@@ -336,6 +470,23 @@ local function getSelectedVehicleType()
     return VEHICLE_TYPES[App.selected_vehicle_index] or VEHICLE_TYPES[1]
 end
 
+local function clampLauncherButtonSize(value)
+    local size = math.floor((tonumber(value) or DEFAULT_SETTINGS.button_size or 44) + 0.5)
+    if size < LAUNCHER_BUTTON_MIN_SIZE then
+        size = LAUNCHER_BUTTON_MIN_SIZE
+    elseif size > LAUNCHER_BUTTON_MAX_SIZE then
+        size = LAUNCHER_BUTTON_MAX_SIZE
+    end
+    return size
+end
+
+local function getLauncherButtonSize()
+    if type(App.settings) ~= "table" then
+        return clampLauncherButtonSize(DEFAULT_SETTINGS.button_size)
+    end
+    return clampLauncherButtonSize(App.settings.button_size)
+end
+
 local function normalizeSettingsValue(settings)
     if type(settings) ~= "table" then
         return false
@@ -366,6 +517,12 @@ local function normalizeSettingsValue(settings)
     local vehicleType = VEHICLE_TYPES[getVehicleTypeIndex(settings.vehicle_type)]
     if settings.vehicle_type ~= vehicleType then
         settings.vehicle_type = vehicleType
+        changed = true
+    end
+
+    local buttonSize = clampLauncherButtonSize(settings.button_size)
+    if settings.button_size ~= buttonSize then
+        settings.button_size = buttonSize
         changed = true
     end
 
@@ -427,7 +584,17 @@ local function startsWith(text, prefix)
     return text:sub(1, #prefix) == prefix
 end
 
-local function safeShow(widget, show)
+local function tableHasEntries(value)
+    if type(value) ~= "table" then
+        return false
+    end
+    for _ in pairs(value) do
+        return true
+    end
+    return false
+end
+
+local function showWidgetRaw(widget, show)
     if widget ~= nil and widget.Show ~= nil then
         pcall(function()
             widget:Show(show and true or false)
@@ -435,7 +602,18 @@ local function safeShow(widget, show)
     end
 end
 
-local function safeSetText(widget, text)
+local function safeShow(widget, show)
+    if type(widget) == "table" and widget.__nuzi_primary ~= nil then
+        for _, outline in ipairs(widget.__nuzi_outline or {}) do
+            showWidgetRaw(outline, show)
+        end
+        showWidgetRaw(widget.__nuzi_primary, show)
+        return
+    end
+    showWidgetRaw(widget, show)
+end
+
+local function setWidgetTextRaw(widget, text)
     if widget ~= nil and widget.SetText ~= nil then
         pcall(function()
             widget:SetText(tostring(text or ""))
@@ -443,7 +621,32 @@ local function safeSetText(widget, text)
     end
 end
 
+local function safeSetText(widget, text)
+    if type(widget) == "table" and widget.__nuzi_primary ~= nil then
+        for _, outline in ipairs(widget.__nuzi_outline or {}) do
+            setWidgetTextRaw(outline, text)
+        end
+        setWidgetTextRaw(widget.__nuzi_primary, text)
+        return
+    end
+    setWidgetTextRaw(widget, text)
+end
+
+local function safeSetExtent(widget, width, height)
+    if type(widget) == "table" and widget.__nuzi_primary ~= nil then
+        widget = widget.__nuzi_primary
+    end
+    if widget ~= nil and widget.SetExtent ~= nil then
+        pcall(function()
+            widget:SetExtent(width, height)
+        end)
+    end
+end
+
 local function isWidgetVisible(widget)
+    if type(widget) == "table" and widget.__nuzi_primary ~= nil then
+        widget = widget.__nuzi_primary
+    end
     if widget == nil then
         return false
     end
@@ -466,7 +669,7 @@ local function isWidgetVisible(widget)
     return visible == true
 end
 
-local function setLabelColor(label, rgba)
+local function applyLabelColorRaw(label, rgba)
     if label == nil or label.style == nil or label.style.SetColor == nil then
         return
     end
@@ -478,6 +681,26 @@ local function setLabelColor(label, rgba)
             (tonumber(color[3]) or 255) / 255,
             (tonumber(color[4]) or 255) / 255
         )
+    end)
+end
+
+local function setLabelColor(label, rgba)
+    if type(label) == "table" and label.__nuzi_primary ~= nil then
+        for _, outline in ipairs(label.__nuzi_outline or {}) do
+            applyLabelColorRaw(outline, LABEL_OUTLINE_COLOR)
+        end
+        applyLabelColorRaw(label.__nuzi_primary, rgba)
+        return
+    end
+    applyLabelColorRaw(label, rgba)
+end
+
+local function setLabelShadow(label, enabled)
+    if label == nil or label.style == nil or label.style.SetShadow == nil then
+        return
+    end
+    pcall(function()
+        label.style:SetShadow(enabled and true or false)
     end)
 end
 
@@ -499,11 +722,46 @@ local function createLabel(id, parent, text, x, y, width, height, fontSize)
         if label.style.SetAlign ~= nil then
             label.style:SetAlign(ALIGN.LEFT)
         end
-        if label.style.SetShadow ~= nil then
-            label.style:SetShadow(true)
-        end
+        setLabelShadow(label, true)
     end
     return label
+end
+
+local function createOutlinedLabel(id, parent, text, x, y, width, height, fontSize)
+    local outlineOffsets = {
+        { -1, 0 },
+        { 1, 0 },
+        { 0, -1 },
+        { 0, 1 }
+    }
+    local outlines = {}
+    for index, offset in ipairs(outlineOffsets) do
+        local outline = createLabel(
+            string.format("%sOutline%d", id, index),
+            parent,
+            text,
+            x + offset[1],
+            y + offset[2],
+            width,
+            height,
+            fontSize
+        )
+        if outline ~= nil then
+            setLabelShadow(outline, false)
+            applyLabelColorRaw(outline, LABEL_OUTLINE_COLOR)
+            table.insert(outlines, outline)
+        end
+    end
+
+    local primary = createLabel(id, parent, text, x, y, width, height, fontSize)
+    if primary == nil then
+        return nil
+    end
+
+    return {
+        __nuzi_primary = primary,
+        __nuzi_outline = outlines
+    }
 end
 
 local function createButton(id, parent, text, x, y, width, height)
@@ -522,6 +780,40 @@ local function createButton(id, parent, text, x, y, width, height)
             api.Interface:ApplyButtonSkin(button, BUTTON_BASIC.DEFAULT)
         end)
     end
+    return button
+end
+
+local function createLauncherButton(id, x, y, size)
+    local button = nil
+    pcall(function()
+        if api.Interface ~= nil and api.Interface.CreateEmptyWindow ~= nil then
+            button = api.Interface:CreateEmptyWindow(id, "UIParent")
+        elseif api.Interface ~= nil and api.Interface.CreateWidget ~= nil then
+            button = api.Interface:CreateWidget("button", id, api.rootWindow)
+        end
+    end)
+    if button == nil then
+        return nil
+    end
+
+    pcall(function()
+        if button.AddAnchor ~= nil then
+            button:AddAnchor("TOPLEFT", x, y)
+        end
+        if button.SetExtent ~= nil then
+            button:SetExtent(size or 44, size or 44)
+        end
+        if button.SetText ~= nil then
+            button:SetText("")
+        end
+        if button.SetUILayer ~= nil then
+            button:SetUILayer("game")
+        end
+        if button.Show ~= nil then
+            button:Show(true)
+        end
+    end)
+
     return button
 end
 
@@ -605,6 +897,139 @@ local function createEdit(id, parent, text, x, y, width, maxLength)
         end)
     end
     return field
+end
+
+local function createSlider(id, parent, x, y, width, minValue, maxValue, step)
+    local slider = nil
+    if CreateNuziSlider ~= nil then
+        local ok, result = pcall(function()
+            return CreateNuziSlider(id, parent)
+        end)
+        if ok then
+            slider = result
+        end
+    end
+    if slider == nil and api._Library ~= nil and api._Library.UI ~= nil and api._Library.UI.CreateSlider ~= nil then
+        local ok, result = pcall(function()
+            return api._Library.UI.CreateSlider(id, parent)
+        end)
+        if ok then
+            slider = result
+        end
+    end
+    if slider ~= nil then
+        pcall(function()
+            slider:AddAnchor("TOPLEFT", x, y)
+            slider:SetExtent(width or 160, 26)
+            slider:SetMinMaxValues(minValue, maxValue)
+            if slider.SetStep ~= nil then
+                slider:SetStep(step or 1)
+            elseif slider.SetValueStep ~= nil then
+                slider:SetValueStep(step or 1)
+            end
+        end)
+    end
+    return slider
+end
+
+local function setSliderValue(slider, value)
+    if slider == nil then
+        return
+    end
+    pcall(function()
+        if slider.SetValue ~= nil then
+            slider:SetValue(value, false)
+        elseif slider.SetInitialValue ~= nil then
+            slider:SetInitialValue(value)
+        end
+    end)
+end
+
+local function ensureLauncherButtonIcon(button)
+    if button == nil then
+        return nil
+    end
+    if button.__nuzi_icon ~= nil then
+        return button.__nuzi_icon
+    end
+    if button.CreateImageDrawable == nil then
+        return nil
+    end
+
+    local icon = nil
+    pcall(function()
+        icon = button:CreateImageDrawable("nuziTradeToggleButtonIcon", "artwork")
+    end)
+    if icon == nil then
+        return nil
+    end
+
+    pcall(function()
+        if icon.SetTexture ~= nil then
+            icon:SetTexture(resolveAssetPath("nuzi-trade/icon.png"))
+        end
+        if icon.AddAnchor ~= nil then
+            icon:AddAnchor("TOPLEFT", button, 0, 0)
+        end
+        if icon.Show ~= nil then
+            icon:Show(true)
+        end
+    end)
+
+    button.__nuzi_icon = icon
+    return icon
+end
+
+local function applyLauncherButtonAppearance()
+    local button = App.ui.button
+    if button == nil then
+        return
+    end
+
+    local size = getLauncherButtonSize()
+    safeSetExtent(button, size, size)
+
+    local icon = ensureLauncherButtonIcon(button)
+    if icon ~= nil then
+        if button.SetText ~= nil then
+            pcall(function()
+                button:SetText("")
+            end)
+        end
+        if icon.SetExtent ~= nil then
+            pcall(function()
+                icon:SetExtent(size, size)
+            end)
+        end
+        if icon.Show ~= nil then
+            pcall(function()
+                icon:Show(true)
+            end)
+        end
+    elseif button.SetText ~= nil then
+        pcall(function()
+            button:SetText("NT")
+        end)
+    end
+
+    safeSetText(App.ui.controls.launcher_size_value, tostring(size))
+end
+
+local function setLauncherButtonSize(value, saveNow)
+    if type(App.settings) ~= "table" then
+        return
+    end
+    local size = clampLauncherButtonSize(value)
+    App.settings.button_size = size
+    applyLauncherButtonAppearance()
+    if App.ui.controls.launcher_size_slider ~= nil and not App.syncing_launcher_slider then
+        App.syncing_launcher_slider = true
+        setSliderValue(App.ui.controls.launcher_size_slider, size)
+        App.syncing_launcher_slider = false
+    end
+    if saveNow then
+        saveSettings()
+    end
 end
 
 local function setComboItems(ctrl, items)
@@ -784,6 +1209,28 @@ local function logInfo(message)
     logger:Info(tostring(message))
 end
 
+reloadZoneStateModule = function()
+    if type(package) == "table" and type(package.loaded) == "table" then
+        package.loaded["nuzi-trade/zone_state"] = nil
+        package.loaded["nuzi-trade.zone_state"] = nil
+    end
+
+    local module, _, errors = Require.Try({
+        "nuzi-trade/zone_state",
+        "nuzi-trade.zone_state"
+    })
+    if module ~= nil then
+        ZoneStateModule = module
+        App.zone_state_manager = nil
+        return module
+    end
+
+    if type(errors) == "table" and #errors > 0 then
+        logInfo("Unable to reload zone_state module: " .. Require.DescribeErrors(errors))
+    end
+    return ZoneStateModule
+end
+
 local function loadPriceRows()
     if App.price_rows ~= nil then
         return App.price_rows
@@ -832,7 +1279,7 @@ local function shouldIncludeTradeRow(destination, currency)
     return true
 end
 
-local function saveSettings()
+saveSettings = function()
     if App.settings == nil then
         return
     end
@@ -1114,8 +1561,15 @@ local function findStaticDestinationName(name)
 end
 
 ensureZoneState = function()
-    if ZoneStateModule == nil then
+    if ZoneStateModule == nil or type(ZoneStateModule.Create) ~= "function" then
+        reloadZoneStateModule()
+    end
+    if ZoneStateModule == nil or type(ZoneStateModule.Create) ~= "function" then
         return nil
+    end
+    if App.zone_state_manager ~= nil and type(App.zone_state_manager.BuildWatchRows) ~= "function" then
+        App.zone_state_manager = nil
+        reloadZoneStateModule()
     end
     if App.zone_state_manager == nil then
         App.zone_state_manager = ZoneStateModule.Create({
@@ -1125,6 +1579,11 @@ ensureZoneState = function()
             trim = trim,
             normalize_key = normalizeKey,
             get_ui_now_ms = getUiNowMs,
+            call_store = callStore,
+            collect_zone_entries = collectZoneEntries,
+            dedupe_entries = dedupeEntries,
+            names_match = destinationNamesMatch,
+            catalog_refresh_interval_ms = ZONE_WATCH_CATALOG_REFRESH_INTERVAL_MS,
             find_static_destination_name = findStaticDestinationName,
             is_all_destinations_entry = isAllDestinationsEntry
         })
@@ -1132,42 +1591,38 @@ ensureZoneState = function()
     return App.zone_state_manager
 end
 
-local function applyDestinationZoneState(entry, force)
+refreshZoneWatchRows = function(force)
     local manager = ensureZoneState()
-    if manager == nil then
-        return entry
-    end
-    return manager:ApplyDestinationState(entry, force)
-end
+    local rowsByKey = {}
+    local rows = nil
+    local refreshedAtMs = getUiNowMs()
 
-buildDestinationStateSummary = function(destination)
-    local manager = ensureZoneState()
-    if manager == nil then
-        return "", ZONE_STATE_COLORS.unknown
-    end
-    return manager:BuildDestinationSummary(destination)
-end
-
-buildOriginStateSummary = function(origin)
-    local manager = ensureZoneState()
-    if manager == nil then
-        return "", ZONE_STATE_COLORS.unknown
-    end
-    return manager:BuildOriginSummary(origin, App.live_origin_id, App.live_origin_name)
-end
-
-refreshZoneStateData = function(force)
-    local origin = App.origins[App.selected_origin_index]
-    if origin == nil then
-        return
+    if manager ~= nil and type(manager.BuildWatchRows) == "function" then
+        local ok, result = pcall(function()
+            return manager:BuildWatchRows(ZONE_WATCH_ZONES, force)
+        end)
+        if ok and type(result) == "table" then
+            rows = result
+            App.zone_watch_fallback_logged = false
+        elseif not App.zone_watch_fallback_logged then
+            logInfo("Zone watch compatibility fallback enabled: " .. tostring(result))
+            App.zone_watch_fallback_logged = true
+        end
     end
 
-    resolveLiveCatalogForOrigin(origin.name)
-    for _, entry in ipairs(App.destinations or {}) do
-        applyDestinationZoneState(entry, force)
+    if type(rows) ~= "table" then
+        rows = buildZoneWatchRowsFallback(force)
     end
 
-    App.zone_state_last_refresh_ms = getUiNowMs()
+    for _, row in ipairs(rows or {}) do
+        if type(row) == "table" and trim(row.name) ~= "" then
+            rowsByKey[normalizeKey(row.name)] = row
+        end
+    end
+    App.zone_watch_rows = rowsByKey
+    App.zone_watch_last_refresh_ms = refreshedAtMs
+    App.zone_watch_countdown_started_ms = refreshedAtMs
+    App.zone_watch_last_render_second = math.floor(refreshedAtMs / 1000)
 end
 
 local function buildOriginPatterns(name)
@@ -1280,7 +1735,7 @@ local function buildRouteRows(originName, destinationName, percent)
     return routeRows
 end
 
-local function callStore(method, ...)
+callStore = function(method, ...)
     if api.Store == nil or api.Store[method] == nil then
         return nil
     end
@@ -1329,7 +1784,7 @@ local function extractStringField(entry)
     return nil
 end
 
-local function collectZoneEntries(node, results, visited)
+collectZoneEntries = function(node, results, visited)
     if type(node) ~= "table" or visited[node] then
         return
     end
@@ -1351,7 +1806,7 @@ local function collectZoneEntries(node, results, visited)
     end
 end
 
-local function dedupeEntries(entries)
+dedupeEntries = function(entries)
     local seen = {}
     local deduped = {}
     for _, entry in ipairs(entries or {}) do
@@ -1430,7 +1885,7 @@ local function originNamesMatch(liveName, staticName)
     return false
 end
 
-local function destinationNamesMatch(left, right)
+destinationNamesMatch = function(left, right)
     local leftCandidates = buildZoneNameCandidates(left)
     local rightCandidates = buildZoneNameCandidates(right)
     for _, leftKey in ipairs(leftCandidates) do
@@ -1444,6 +1899,390 @@ local function destinationNamesMatch(left, right)
         end
     end
     return false
+end
+
+buildZoneWatchRowsFallback = function(force)
+    local now = getUiNowMs()
+
+    local function getStateColor(key)
+        return ZONE_STATE_COLORS[tostring(key or "unknown")] or ZONE_STATE_COLORS.unknown
+    end
+
+    local function inferStateKey(text)
+        local normalized = normalizeKey(text)
+        if normalized == "" then
+            return nil
+        end
+        if normalized:find("war", 1, true) ~= nil or normalized:find("siege", 1, true) ~= nil then
+            return "war"
+        end
+        if normalized:find("conflict", 1, true) ~= nil
+            or normalized:find("contested", 1, true) ~= nil
+            or normalized:find("combat", 1, true) ~= nil then
+            return "conflict"
+        end
+        if normalized:find("peace", 1, true) ~= nil or normalized:find("safe", 1, true) ~= nil then
+            return "peace"
+        end
+        return nil
+    end
+
+    local function getStateConstant(name, fallback)
+        local value = _G ~= nil and _G[name] or nil
+        value = tonumber(value)
+        if value == nil then
+            return tonumber(fallback)
+        end
+        return value
+    end
+
+    local function normalizeRemainTime(value)
+        local remainTime = tonumber(value)
+        if remainTime == nil then
+            return nil
+        end
+        if remainTime < 0 then
+            remainTime = 0
+        end
+        if remainTime > (86400 * 30) then
+            remainTime = remainTime / 1000
+        end
+        return math.floor(remainTime + 0.5)
+    end
+
+    local function formatZoneWatchTime(value)
+        local totalSeconds = normalizeRemainTime(value)
+        if totalSeconds == nil then
+            return "-"
+        end
+
+        local days = math.floor(totalSeconds / 86400)
+        local hours = math.floor((totalSeconds % 86400) / 3600)
+        local minutes = math.floor((totalSeconds % 3600) / 60)
+        local seconds = totalSeconds % 60
+
+        if days > 0 then
+            return string.format("%dd %02d:%02d", days, hours, minutes)
+        end
+        if hours > 0 then
+            return string.format("%d:%02d:%02d", hours, minutes, seconds)
+        end
+        return string.format("%02d:%02d", minutes, seconds)
+    end
+
+    local function findNumericField(node, fieldName, visited, depth)
+        depth = tonumber(depth) or 0
+        if depth > 2 then
+            return nil
+        end
+        if type(node) ~= "table" or visited[node] then
+            return nil
+        end
+        visited[node] = true
+
+        local direct = tonumber(node[fieldName])
+        if direct ~= nil then
+            return direct
+        end
+
+        for _, value in pairs(node) do
+            if type(value) == "table" then
+                local nested = findNumericField(value, fieldName, visited, depth + 1)
+                if nested ~= nil then
+                    return nested
+                end
+            end
+        end
+
+        return nil
+    end
+
+    local function findStringField(node, fieldName, visited, depth)
+        depth = tonumber(depth) or 0
+        if depth > 2 then
+            return nil
+        end
+        if type(node) ~= "table" or visited[node] then
+            return nil
+        end
+        visited[node] = true
+
+        local direct = node[fieldName]
+        if type(direct) == "string" and trim(direct) ~= "" then
+            return trim(direct)
+        end
+
+        for _, value in pairs(node) do
+            if type(value) == "table" then
+                local nested = findStringField(value, fieldName, visited, depth + 1)
+                if nested ~= nil then
+                    return nested
+                end
+            end
+        end
+
+        return nil
+    end
+
+    local function findBooleanField(node, fieldName, visited, depth)
+        depth = tonumber(depth) or 0
+        if depth > 2 then
+            return nil
+        end
+        if type(node) ~= "table" or visited[node] then
+            return nil
+        end
+        visited[node] = true
+
+        local direct = node[fieldName]
+        if type(direct) == "boolean" then
+            return direct
+        end
+
+        for _, value in pairs(node) do
+            if type(value) == "table" then
+                local nested = findBooleanField(value, fieldName, visited, depth + 1)
+                if nested ~= nil then
+                    return nested
+                end
+            end
+        end
+
+        return nil
+    end
+
+    local function collectTexts(node, results, visited, depth)
+        depth = tonumber(depth) or 0
+        if depth > 2 then
+            return
+        end
+
+        if type(node) == "string" then
+            local text = trim(node)
+            if text ~= "" then
+                results[#results + 1] = text
+            end
+            return
+        end
+        if type(node) ~= "table" or visited[node] then
+            return
+        end
+        visited[node] = true
+
+        for key, value in pairs(node) do
+            if type(key) == "string" and value == true then
+                local keyHint = inferStateKey(key)
+                if keyHint ~= nil then
+                    results[#results + 1] = keyHint
+                end
+            end
+            if type(value) == "table" then
+                collectTexts(value, results, visited, depth + 1)
+            elseif type(value) == "string" then
+                local text = trim(value)
+                if text ~= "" then
+                    results[#results + 1] = text
+                end
+            end
+        end
+    end
+
+    local function callZoneStateMethod(zoneId)
+        for _, library in ipairs({ api.Zone, api.Map }) do
+            if type(library) == "table" and type(library.GetZoneStateInfoByZoneId) == "function" then
+                local ok, result = pcall(function()
+                    return library:GetZoneStateInfoByZoneId(zoneId)
+                end)
+                if ok then
+                    return result
+                end
+
+                ok, result = pcall(function()
+                    return library.GetZoneStateInfoByZoneId(library, zoneId)
+                end)
+                if ok then
+                    return result
+                end
+            end
+        end
+        return nil
+    end
+
+    local function buildStateRecord(zoneId, key, text, rawInfo)
+        local remainTime = nil
+        local remainText = ""
+        if type(rawInfo) == "table" then
+            remainTime = normalizeRemainTime(findNumericField(rawInfo, "remainTime", {}, 0))
+            remainText = trim(findStringField(rawInfo, "strRemainTime", {}, 0))
+        end
+        if remainText == "" then
+            remainText = formatZoneWatchTime(remainTime)
+        end
+
+        return {
+            zone_id = tonumber(zoneId),
+            key = tostring(key or "unknown"),
+            status_text = tostring(text or "Unknown"),
+            status_color = getStateColor(key),
+            time_text = remainText ~= "" and remainText or "-",
+            time_color = getStateColor(key),
+            remain_time = remainTime
+        }
+    end
+
+    local function getZoneStateRecord(zoneId)
+        local numericZoneId = tonumber(zoneId)
+        if numericZoneId == nil then
+            return buildStateRecord(nil, "unknown", "Unavailable", nil)
+        end
+
+        if type(App.zone_watch_state_cache) ~= "table" then
+            App.zone_watch_state_cache = {}
+        end
+
+        local cached = App.zone_watch_state_cache[numericZoneId]
+        if cached ~= nil and not force and (now - (tonumber(cached.refreshed_at_ms) or 0)) < ZONE_STATE_REFRESH_INTERVAL_MS then
+            return cached
+        end
+
+        local rawInfo = callZoneStateMethod(numericZoneId)
+        local key = nil
+        local text = nil
+
+        if type(rawInfo) == "table" then
+            local conflictState = findNumericField(rawInfo, "conflictState", {}, 0)
+            if conflictState ~= nil then
+                local battleState = getStateConstant("HPWS_BATTLE", 5)
+                local warState = getStateConstant("HPWS_WAR", 6)
+                local peaceState = getStateConstant("HPWS_PEACE", 7)
+                if conflictState < battleState then
+                    key = "conflict"
+                    text = string.format("Conflict (Step %d)", math.max(1, math.floor(conflictState) + 1))
+                elseif conflictState == battleState then
+                    key = "conflict"
+                    text = "Conflict"
+                elseif conflictState == warState then
+                    key = "war"
+                    text = "War"
+                elseif conflictState == peaceState then
+                    key = "peace"
+                    text = "Peace"
+                end
+            end
+
+            if key == nil then
+                if findBooleanField(rawInfo, "isSiegeZone", {}, 0) == true then
+                    key = "war"
+                    text = "War"
+                elseif findBooleanField(rawInfo, "isConflictZone", {}, 0) == true then
+                    key = "conflict"
+                    text = "Conflict"
+                elseif findBooleanField(rawInfo, "isPeaceZone", {}, 0) == true
+                    or findBooleanField(rawInfo, "isNuiaProtectedZone", {}, 0) == true
+                    or findBooleanField(rawInfo, "isHariharaProtectedZone", {}, 0) == true then
+                    key = "peace"
+                    text = "Peace"
+                end
+            end
+        end
+
+        if key == nil then
+            local texts = {}
+            if type(rawInfo) == "string" then
+                texts[#texts + 1] = rawInfo
+            elseif type(rawInfo) == "table" then
+                collectTexts(rawInfo, texts, {}, 0)
+            elseif rawInfo ~= nil then
+                texts[#texts + 1] = tostring(rawInfo)
+            end
+
+            for _, candidate in ipairs(texts) do
+                local matched = inferStateKey(candidate)
+                if matched ~= nil then
+                    key = matched
+                    text = matched == "peace" and "Peace" or (matched == "war" and "War" or "Conflict")
+                    break
+                end
+            end
+        end
+
+        if key == nil then
+            key = "unknown"
+            text = rawInfo ~= nil and "Unknown" or "Unavailable"
+        end
+
+        local state = buildStateRecord(numericZoneId, key, text, rawInfo)
+        state.refreshed_at_ms = now
+        App.zone_watch_state_cache[numericZoneId] = state
+        return state
+    end
+
+    local resolvedCatalog = type(App.zone_watch_catalog) == "table" and App.zone_watch_catalog or {}
+    if force or not tableHasEntries(resolvedCatalog) or (now - (tonumber(App.zone_watch_catalog_refreshed_at_ms) or 0)) >= ZONE_WATCH_CATALOG_REFRESH_INTERVAL_MS then
+        resolvedCatalog = {}
+        local unresolved = {}
+        for _, zoneName in ipairs(ZONE_WATCH_ZONES) do
+            unresolved[normalizeKey(zoneName)] = zoneName
+        end
+
+        local function rememberEntry(entry)
+            local zoneId = type(entry) == "table" and tonumber(entry.id) or nil
+            local zoneName = type(entry) == "table" and trim(entry.name) or ""
+            if zoneId == nil or zoneName == "" then
+                return
+            end
+
+            for zoneKey, wantedName in pairs(unresolved) do
+                if resolvedCatalog[zoneKey] == nil and destinationNamesMatch(zoneName, wantedName) then
+                    resolvedCatalog[zoneKey] = {
+                        id = zoneId,
+                        name = zoneName
+                    }
+                    unresolved[zoneKey] = nil
+                    break
+                end
+            end
+        end
+
+        local origins = {}
+        collectZoneEntries(callStore("GetProductionZoneGroups"), origins, {})
+        origins = dedupeEntries(origins)
+        for _, origin in ipairs(origins) do
+            rememberEntry(origin)
+
+            local destinations = {}
+            collectZoneEntries(callStore("GetSellableZoneGroups", origin.id), destinations, {})
+            destinations = dedupeEntries(destinations)
+            for _, destination in ipairs(destinations) do
+                rememberEntry(destination)
+            end
+        end
+
+        App.zone_watch_catalog = resolvedCatalog
+        App.zone_watch_catalog_refreshed_at_ms = now
+    end
+
+    local rows = {}
+    for _, zoneName in ipairs(ZONE_WATCH_ZONES) do
+        local resolved = resolvedCatalog[normalizeKey(zoneName)]
+        local state = type(resolved) == "table"
+            and getZoneStateRecord(resolved.id)
+            or buildStateRecord(nil, "unknown", "Unavailable", nil)
+
+        rows[#rows + 1] = {
+            name = zoneName,
+            live_name = type(resolved) == "table" and resolved.name or nil,
+            zone_id = type(resolved) == "table" and tonumber(resolved.id) or nil,
+            status_text = state.status_text,
+            status_color = state.status_color,
+            time_text = state.time_text,
+            time_color = state.time_color,
+            key = state.key,
+            remain_time = state.remain_time
+        }
+    end
+
+    return rows
 end
 
 local function findIndexByName(entries, name)
@@ -1823,13 +2662,13 @@ local function buildStaticDestinationEntries(originName)
             local rows = buildRouteRows(originName, canonicalName, nil)
             if #rows > 0 then
                 totalRowCount = totalRowCount + #rows
-                table.insert(destinations, applyDestinationZoneState({
+                table.insert(destinations, {
                     id = nil,
                     name = canonicalName,
                     static_name = canonicalName,
                     percent = nil,
                     row_count = #rows
-                }, false))
+                })
             end
         end
     end
@@ -1905,10 +2744,8 @@ local function refreshDestinationsForSelectedOrigin(preferredName)
         return
     end
 
-    resolveLiveCatalogForOrigin(origin.name)
     local destinations = buildStaticDestinationEntries(origin.name)
     App.destinations = destinations
-    App.zone_state_last_refresh_ms = getUiNowMs()
 
     local preferred = trim(preferredName)
     if preferred == "" then
@@ -2157,6 +2994,63 @@ local function cyclePage(delta)
     end
 end
 
+local function refreshZoneWindowUi()
+    if App.ui.zone_window == nil then
+        return
+    end
+
+    local shouldShow = App.zone_window_visible
+    safeShow(App.ui.zone_window, shouldShow)
+    if not shouldShow then
+        return
+    end
+
+    local nowMs = getUiNowMs()
+    local countdownStartedMs = tonumber(App.zone_watch_countdown_started_ms) or 0
+
+    local function resolveZoneTimeText(row)
+        if type(row) ~= "table" then
+            return "-"
+        end
+
+        local remainSeconds = tonumber(row.remain_time)
+        if remainSeconds == nil or countdownStartedMs <= 0 then
+            return tostring(row.time_text or "-")
+        end
+
+        local elapsedSeconds = math.max(0, math.floor((nowMs - countdownStartedMs) / 1000))
+        return formatRouteDuration(math.max(0, remainSeconds - elapsedSeconds))
+    end
+
+    for _, widgets in ipairs(App.ui.zone_rows or {}) do
+        if widgets.kind == "section" then
+            setLabelColor(widgets.label, ZONE_WINDOW_SECTION_COLOR)
+        elseif widgets.kind == "zone" then
+            local row = App.zone_watch_rows[normalizeKey(widgets.zone_name)] or {}
+            safeSetText(widgets.name, widgets.zone_name)
+            safeSetText(widgets.status, tostring(row.status_text or "Unavailable"))
+            safeSetText(widgets.time, resolveZoneTimeText(row))
+            setLabelColor(widgets.name, ZONE_WINDOW_NAME_COLOR)
+            setLabelColor(widgets.status, row.status_color or ZONE_STATE_COLORS.unknown)
+            setLabelColor(widgets.time, row.time_color or ZONE_STATE_COLORS.unknown)
+        end
+    end
+end
+
+updateZoneWindowVisibility = function()
+    if App.ui.zone_window ~= nil then
+        safeShow(App.ui.zone_window, App.zone_window_visible)
+    end
+end
+
+toggleZoneWindow = function()
+    App.zone_window_visible = not App.zone_window_visible
+    if App.zone_window_visible then
+        refreshZoneWatchRows(true)
+    end
+    refreshUi()
+end
+
 refreshUi = function()
     if App.ui.window == nil and App.ui.timer_window == nil then
         return
@@ -2198,6 +3092,7 @@ refreshUi = function()
     updateTimerWidgetVisibility()
 
     if not App.visible or App.ui.window == nil then
+        refreshZoneWindowUi()
         return
     end
 
@@ -2209,12 +3104,9 @@ refreshUi = function()
     local destinationIndexText = destinationTotal > 0 and tostring(App.selected_destination_index) or "0"
     local pageCount = math.max(1, math.ceil(#App.route_rows / ROWS_PER_PAGE))
     local rowStart = ((App.route_page_index - 1) * ROWS_PER_PAGE) + 1
-    local selectedOrigin = App.origins[App.selected_origin_index]
     local selectedDestination = App.destinations[App.selected_destination_index]
     local allDestinationsMode = isAllDestinationsEntry(selectedDestination)
     local selectedPack = getSelectedPackFilter()
-    local originStateText, originStateColor = buildOriginStateSummary(selectedOrigin)
-    local destinationStateText, destinationStateColor = buildDestinationStateSummary(selectedDestination)
 
     local originItems = {}
     for _, entry in ipairs(App.origins or {}) do
@@ -2257,10 +3149,7 @@ refreshUi = function()
     safeSetText(App.ui.controls.origin_meta, string.format("%s / %d", originIndexText, originTotal))
     safeSetText(App.ui.controls.pack_meta, string.format("%s / %d", packIndexText, packTotal))
     safeSetText(App.ui.controls.destination_meta, string.format("%s / %d", destinationIndexText, destinationTotal))
-    safeSetText(App.ui.controls.origin_state, originStateText)
-    setLabelColor(App.ui.controls.origin_state, originStateColor)
-    safeSetText(App.ui.controls.destination_state, destinationStateText)
-    setLabelColor(App.ui.controls.destination_state, destinationStateColor)
+    safeSetText(App.ui.controls.launcher_size_value, tostring(getLauncherButtonSize()))
     safeSetText(App.ui.controls.page_value, string.format("Page %d / %d", App.route_page_index, pageCount))
     safeSetText(App.ui.controls.pack_header, allDestinationsMode and (selectedPack ~= "" and "Destination" or "Destination / Pack") or "Pack")
     safeSetText(App.ui.controls.currency_header, "Currency")
@@ -2320,6 +3209,8 @@ refreshUi = function()
             end
         end
     end
+
+    refreshZoneWindowUi()
 end
 
 updateTimerWidgetVisibility = function()
@@ -2343,6 +3234,7 @@ local function closeWindow()
     if App.ui.window ~= nil then
         safeShow(App.ui.window, false)
     end
+    updateZoneWindowVisibility()
     updateTimerWidgetVisibility()
     App.closing_window = false
 end
@@ -2357,6 +3249,9 @@ local function openWindow()
     refreshPacksForSelectedOrigin(App.settings.pack_name)
     refreshDestinationsForSelectedOrigin(App.settings.destination_name)
     refreshSelectedRoute()
+    if App.zone_window_visible then
+        refreshZoneWatchRows(true)
+    end
     safeSetText(App.ui.controls.percent_input, App.settings.manual_percent_text or "130")
     refreshUi()
 end
@@ -2371,8 +3266,8 @@ end
 
 local function createUi()
     if App.ui.button == nil then
-        local parent = api.rootWindow
-        local button = createButton("nuziTradeToggleButton", parent, "NT", App.settings.button_x, App.settings.button_y, 44, 28)
+        local launcherSize = getLauncherButtonSize()
+        local button = createLauncherButton("nuziTradeToggleButton", App.settings.button_x, App.settings.button_y, launcherSize)
         if button ~= nil and button.SetHandler ~= nil then
             button:SetHandler("OnClick", function()
                 toggleWindow()
@@ -2382,6 +3277,7 @@ local function createUi()
             end)
         end
         App.ui.button = button
+        applyLauncherButtonAppearance()
     end
 
     if App.ui.window ~= nil then
@@ -2415,7 +3311,6 @@ local function createUi()
     createLabel("nuziTradeOriginLabel", window, "Origin", 18, 42, 54, 18, 13)
     App.ui.controls.origin_combo = createComboBox(window, 84, 36, 340, { "Loading..." })
     App.ui.controls.origin_meta = createLabel("nuziTradeOriginMeta", window, "", 432, 42, 56, 18, 12)
-    App.ui.controls.origin_state = createLabel("nuziTradeOriginState", window, "", 496, 42, 228, 18, 12)
     if App.ui.controls.origin_combo ~= nil then
         pcall(function()
             App.ui.controls.origin_combo:SetHandler("OnSelChanged", onOriginSelected)
@@ -2434,7 +3329,6 @@ local function createUi()
     createLabel("nuziTradeDestinationLabel", window, "Destination", 18, 106, 70, 18, 13)
     App.ui.controls.destination_combo = createComboBox(window, 84, 100, 340, { "Loading..." })
     App.ui.controls.destination_meta = createLabel("nuziTradeDestinationMeta", window, "", 432, 106, 56, 18, 12)
-    App.ui.controls.destination_state = createLabel("nuziTradeDestinationState", window, "", 496, 106, 228, 18, 12)
     if App.ui.controls.destination_combo ~= nil then
         pcall(function()
             App.ui.controls.destination_combo:SetHandler("OnSelChanged", onDestinationSelected)
@@ -2443,6 +3337,34 @@ local function createUi()
 
     createLabel("nuziTradeManualPercentLabel", window, "Live %", 18, 138, 54, 18, 13)
     App.ui.controls.percent_input = createEdit("nuziTradeManualPercent", window, App.settings.manual_percent_text or "130", 84, 132, 96, 8)
+
+    createLabel("nuziTradeLauncherSizeLabel", window, "Launcher", 492, 42, 58, 18, 13)
+    App.ui.controls.launcher_size_slider = createSlider(
+        "nuziTradeLauncherSize",
+        window,
+        552,
+        38,
+        144,
+        LAUNCHER_BUTTON_MIN_SIZE,
+        LAUNCHER_BUTTON_MAX_SIZE,
+        1
+    )
+    App.ui.controls.launcher_size_value = createLabel("nuziTradeLauncherSizeValue", window, "", 700, 42, 28, 18, 12)
+    if App.ui.controls.launcher_size_slider ~= nil and App.ui.controls.launcher_size_slider.SetHandler ~= nil then
+        App.ui.controls.launcher_size_slider:SetHandler("OnSliderChanged", function(_, raw)
+            if App.syncing_launcher_slider then
+                return
+            end
+            setLauncherButtonSize(raw, true)
+        end)
+    end
+
+    local zonesButton = createButton("nuziTradeZones", window, "Zones", 736, 36, 104, 32)
+    if zonesButton ~= nil and zonesButton.SetHandler ~= nil then
+        zonesButton:SetHandler("OnClick", function()
+            toggleZoneWindow()
+        end)
+    end
 
     local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 736, 84, 104, 40)
     if refreshButton ~= nil and refreshButton.SetHandler ~= nil then
@@ -2453,6 +3375,7 @@ local function createUi()
     end
 
     App.ui.controls.page_value = createLabel("nuziTradePageValue", window, "", 18, 146, 180, 18, 12)
+    setLauncherButtonSize(getLauncherButtonSize(), false)
 
     local prevButton = createButton("nuziTradePrevPage", window, "Prev Page", 568, 140, 88, 24)
     if prevButton ~= nil and prevButton.SetHandler ~= nil then
@@ -2527,6 +3450,67 @@ local function createUi()
         safeShow(timerWindow, false)
     end
 
+    local zoneWindow = api.Interface:CreateWindow("nuziTradeZoneWindow", "Nuzi Trade Zone Status", 520, 344)
+    if zoneWindow ~= nil then
+        zoneWindow:AddAnchor("TOPLEFT", "UIParent", App.settings.zone_window_x, App.settings.zone_window_y)
+        enableDrag(zoneWindow, function(self)
+            saveWidgetPosition(self, "zone_window_x", "zone_window_y")
+        end)
+
+        local function onZoneWindowClosed()
+            App.zone_window_visible = false
+            refreshUi()
+        end
+
+        pcall(function()
+            zoneWindow:SetHandler("OnCloseByEsc", onZoneWindowClosed)
+        end)
+        pcall(function()
+            zoneWindow:SetHandler("OnHide", onZoneWindowClosed)
+        end)
+        pcall(function()
+            zoneWindow:SetHandler("OnClose", onZoneWindowClosed)
+        end)
+
+        createOutlinedLabel("nuziTradeZoneSummary", zoneWindow, "Status and timer for the current contested-zone rotation.", 16, 40, 340, 18, 12)
+
+        local zoneRefreshButton = createButton("nuziTradeZoneRefresh", zoneWindow, "Refresh", 400, 34, 96, 24)
+        if zoneRefreshButton ~= nil and zoneRefreshButton.SetHandler ~= nil then
+            zoneRefreshButton:SetHandler("OnClick", function()
+                refreshZoneWatchRows(true)
+                refreshUi()
+            end)
+        end
+
+        createOutlinedLabel("nuziTradeZoneHeaderName", zoneWindow, "Zone", 18, 72, 170, 18, 12)
+        createOutlinedLabel("nuziTradeZoneHeaderState", zoneWindow, "Status", 220, 72, 148, 18, 12)
+        createOutlinedLabel("nuziTradeZoneHeaderTime", zoneWindow, "Time Left", 394, 72, 96, 18, 12)
+
+        local y = 96
+        App.ui.zone_rows = {}
+        for _, entry in ipairs(ZONE_WATCH_LAYOUT) do
+            if entry.kind == "section" then
+                App.ui.zone_rows[#App.ui.zone_rows + 1] = {
+                    kind = "section",
+                    label = createOutlinedLabel("nuziTradeZoneSection" .. tostring(#App.ui.zone_rows + 1), zoneWindow, entry.title, 18, y, 180, 18, 13)
+                }
+                y = y + 22
+            else
+                App.ui.zone_rows[#App.ui.zone_rows + 1] = {
+                    kind = "zone",
+                    zone_name = entry.name,
+                    name = createOutlinedLabel("nuziTradeZoneName" .. tostring(#App.ui.zone_rows + 1), zoneWindow, entry.name, 18, y, 182, 18, 12),
+                    status = createOutlinedLabel("nuziTradeZoneState" .. tostring(#App.ui.zone_rows + 1), zoneWindow, "Unavailable", 220, y, 160, 18, 12),
+                    time = createOutlinedLabel("nuziTradeZoneTime" .. tostring(#App.ui.zone_rows + 1), zoneWindow, "-", 394, y, 96, 18, 12)
+                }
+                y = y + 18
+            end
+        end
+
+        App.ui.zone_window = zoneWindow
+        safeShow(zoneWindow, false)
+    end
+
     safeShow(window, false)
 end
 
@@ -2547,12 +3531,19 @@ local function unloadUi()
                 api.Interface:Free(App.ui.timer_window)
             end)
         end
+        if App.ui.zone_window ~= nil then
+            pcall(function()
+                api.Interface:Free(App.ui.zone_window)
+            end)
+        end
     end
     App.ui.button = nil
     App.ui.window = nil
     App.ui.timer_window = nil
+    App.ui.zone_window = nil
     App.ui.controls = {}
     App.ui.rows = {}
+    App.ui.zone_rows = {}
 end
 
 local function onUpdate(dt)
@@ -2560,7 +3551,7 @@ local function onUpdate(dt)
         return
     end
 
-    if not App.visible and not App.route_timer.running then
+    if not App.visible and not App.zone_window_visible and not App.route_timer.running then
         return
     end
 
@@ -2569,10 +3560,20 @@ local function onUpdate(dt)
         return
     end
 
-    if App.visible then
+    if App.zone_window_visible then
+        if App.ui.zone_window ~= nil and not isWidgetVisible(App.ui.zone_window) then
+            App.zone_window_visible = false
+            refreshUi()
+            return
+        end
         local now = getUiNowMs()
-        if (now - (tonumber(App.zone_state_last_refresh_ms) or 0)) >= ZONE_STATE_REFRESH_INTERVAL_MS then
-            refreshZoneStateData(true)
+        local renderSecond = math.floor(now / 1000)
+        if renderSecond ~= App.zone_watch_last_render_second then
+            App.zone_watch_last_render_second = renderSecond
+            refreshUi()
+        end
+        if (now - (tonumber(App.zone_watch_last_refresh_ms) or 0)) >= ZONE_STATE_REFRESH_INTERVAL_MS then
+            refreshZoneWatchRows(false)
             refreshUi()
         end
     end
@@ -2587,6 +3588,7 @@ local function onUpdate(dt)
 end
 
 local function onUiReloaded()
+    App.zone_state_manager = nil
     unloadUi()
     createUi()
     if App.visible then
@@ -2610,6 +3612,7 @@ end
 function addon.OnUnload()
     App.loaded = false
     App.visible = false
+    App.zone_state_manager = nil
     unloadUi()
     events:ClearAll()
 end

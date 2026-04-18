@@ -38,9 +38,39 @@ function ZoneState.Create(options)
         or function(entry)
             return type(entry) == "table" and entry.all == true
         end
+    local callStore = type(options.call_store) == "function"
+        and options.call_store
+        or function()
+            return nil
+        end
+    local collectZoneEntries = type(options.collect_zone_entries) == "function"
+        and options.collect_zone_entries
+        or function()
+        end
+    local dedupeEntries = type(options.dedupe_entries) == "function"
+        and options.dedupe_entries
+        or function(entries)
+            return type(entries) == "table" and entries or {}
+        end
+    local namesMatch = type(options.names_match) == "function"
+        and options.names_match
+        or function(left, right)
+            return normalizeKey(left) == normalizeKey(right)
+        end
+    local catalogRefreshIntervalMs = tonumber(options.catalog_refresh_interval_ms) or 60000
 
     local function getColor(key)
         return colors[tostring(key or "unknown")] or colors.unknown or DEFAULT_UNKNOWN_COLOR
+    end
+
+    local function tableHasEntries(value)
+        if type(value) ~= "table" then
+            return false
+        end
+        for _ in pairs(value) do
+            return true
+        end
+        return false
     end
 
     local function titleCaseText(text)
@@ -121,6 +151,62 @@ function ZoneState.Create(options)
         return nil
     end
 
+    local function findStringField(node, fieldName, visited, depth)
+        depth = tonumber(depth) or 0
+        if depth > 2 then
+            return nil
+        end
+
+        if type(node) ~= "table" or visited[node] then
+            return nil
+        end
+        visited[node] = true
+
+        local direct = node[fieldName]
+        if type(direct) == "string" and trim(direct) ~= "" then
+            return trim(direct)
+        end
+
+        for _, value in pairs(node) do
+            if type(value) == "table" then
+                local nested = findStringField(value, fieldName, visited, depth + 1)
+                if nested ~= nil then
+                    return nested
+                end
+            end
+        end
+
+        return nil
+    end
+
+    local function findBooleanField(node, fieldName, visited, depth)
+        depth = tonumber(depth) or 0
+        if depth > 2 then
+            return nil
+        end
+
+        if type(node) ~= "table" or visited[node] then
+            return nil
+        end
+        visited[node] = true
+
+        local direct = node[fieldName]
+        if type(direct) == "boolean" then
+            return direct
+        end
+
+        for _, value in pairs(node) do
+            if type(value) == "table" then
+                local nested = findBooleanField(value, fieldName, visited, depth + 1)
+                if nested ~= nil then
+                    return nested
+                end
+            end
+        end
+
+        return nil
+    end
+
     local function collectZoneStateTexts(node, results, visited, depth)
         depth = tonumber(depth) or 0
         if depth > 2 then
@@ -189,10 +275,67 @@ function ZoneState.Create(options)
             key = normalizedKey,
             text = displayText,
             short_text = shortText,
+            remain_time = nil,
+            remain_time_text = "-",
             color = getColor(normalizedKey),
             available = available == true,
             risky = normalizedKey == "war" or normalizedKey == "conflict"
         }
+    end
+
+    local function normalizeRemainTime(value)
+        local remainTime = tonumber(value)
+        if remainTime == nil then
+            return nil
+        end
+        if remainTime < 0 then
+            remainTime = 0
+        end
+        if remainTime > (86400 * 30) then
+            remainTime = remainTime / 1000
+        end
+        return math.floor(remainTime + 0.5)
+    end
+
+    local function formatRemainTime(value)
+        local totalSeconds = normalizeRemainTime(value)
+        if totalSeconds == nil then
+            return "-"
+        end
+
+        local days = math.floor(totalSeconds / 86400)
+        local hours = math.floor((totalSeconds % 86400) / 3600)
+        local minutes = math.floor((totalSeconds % 3600) / 60)
+        local seconds = totalSeconds % 60
+
+        if days > 0 then
+            return string.format("%dd %02d:%02d", days, hours, minutes)
+        end
+        if hours > 0 then
+            return string.format("%d:%02d:%02d", hours, minutes, seconds)
+        end
+        return string.format("%02d:%02d", minutes, seconds)
+    end
+
+    local function applyRemainTime(record, rawInfo)
+        if type(record) ~= "table" then
+            return record
+        end
+
+        local remainTime = nil
+        local remainText = nil
+        if type(rawInfo) == "table" then
+            remainTime = normalizeRemainTime(findNumericField(rawInfo, "remainTime", {}, 0))
+            remainText = trim(findStringField(rawInfo, "strRemainTime", {}, 0))
+        end
+
+        if remainText == "" then
+            remainText = formatRemainTime(remainTime)
+        end
+
+        record.remain_time = remainTime
+        record.remain_time_text = remainText ~= "" and remainText or "-"
+        return record
     end
 
     local function buildConflictStateRecord(zoneId, conflictState)
@@ -279,7 +422,19 @@ function ZoneState.Create(options)
             local conflictState = findNumericField(rawInfo, "conflictState", {}, 0)
             local conflictRecord = buildConflictStateRecord(zoneId, conflictState)
             if conflictRecord ~= nil then
-                return conflictRecord
+                return applyRemainTime(conflictRecord, rawInfo)
+            end
+
+            if findBooleanField(rawInfo, "isSiegeZone", {}, 0) == true then
+                return applyRemainTime(buildZoneStateRecord(zoneId, "war", "War", true), rawInfo)
+            end
+            if findBooleanField(rawInfo, "isConflictZone", {}, 0) == true then
+                return applyRemainTime(buildZoneStateRecord(zoneId, "conflict", "Conflict", true), rawInfo)
+            end
+            if findBooleanField(rawInfo, "isPeaceZone", {}, 0) == true
+                or findBooleanField(rawInfo, "isNuiaProtectedZone", {}, 0) == true
+                or findBooleanField(rawInfo, "isHariharaProtectedZone", {}, 0) == true then
+                return applyRemainTime(buildZoneStateRecord(zoneId, "peace", "Peace", true), rawInfo)
             end
         end
 
@@ -316,15 +471,15 @@ function ZoneState.Create(options)
         end
 
         if matchedKey ~= nil then
-            return buildZoneStateRecord(zoneId, matchedKey, displayText, true)
+            return applyRemainTime(buildZoneStateRecord(zoneId, matchedKey, displayText, true), rawInfo)
         end
         if displayText ~= nil then
-            return buildZoneStateRecord(zoneId, "unknown", titleCaseText(displayText), true)
+            return applyRemainTime(buildZoneStateRecord(zoneId, "unknown", titleCaseText(displayText), true), rawInfo)
         end
         if source == "unsupported" then
             return buildZoneStateRecord(zoneId, "unknown", "Unsupported", false)
         end
-        return buildZoneStateRecord(zoneId, "unknown", "Unknown", rawInfo ~= nil)
+        return applyRemainTime(buildZoneStateRecord(zoneId, "unknown", "Unknown", rawInfo ~= nil), rawInfo)
     end
 
     local function getZoneStateInfo(zoneId, force)
@@ -359,6 +514,77 @@ function ZoneState.Create(options)
             return nil
         end
         return app.live_destinations[normalizeKey(canonicalName)]
+    end
+
+    local function resolveWatchCatalog(watchZones, force)
+        if type(app.zone_watch_catalog) ~= "table" then
+            app.zone_watch_catalog = {}
+        end
+
+        local now = getUiNowMs()
+        if not force
+            and tableHasEntries(app.zone_watch_catalog)
+            and (now - (tonumber(app.zone_watch_catalog_refreshed_at_ms) or 0)) < catalogRefreshIntervalMs then
+            return app.zone_watch_catalog
+        end
+
+        local wantedByKey = {}
+        local unresolved = 0
+        for _, entry in ipairs(watchZones or {}) do
+            local zoneName = type(entry) == "table"
+                and trim(entry.name or entry.zone_name or "")
+                or trim(entry)
+            local key = normalizeKey(zoneName)
+            if key ~= "" and wantedByKey[key] == nil then
+                wantedByKey[key] = zoneName
+                unresolved = unresolved + 1
+            end
+        end
+
+        local catalog = {}
+        local function rememberZone(entry)
+            local zoneId = type(entry) == "table" and tonumber(entry.id) or nil
+            local zoneName = type(entry) == "table" and trim(entry.name) or ""
+            if zoneId == nil or zoneName == "" or unresolved <= 0 then
+                return
+            end
+
+            for key, wantedName in pairs(wantedByKey) do
+                if catalog[key] == nil and namesMatch(zoneName, wantedName) then
+                    catalog[key] = {
+                        id = zoneId,
+                        name = zoneName
+                    }
+                    unresolved = unresolved - 1
+                    break
+                end
+            end
+        end
+
+        local origins = {}
+        collectZoneEntries(callStore("GetProductionZoneGroups"), origins, {})
+        origins = dedupeEntries(origins)
+
+        for _, origin in ipairs(origins) do
+            rememberZone(origin)
+            if unresolved <= 0 then
+                break
+            end
+
+            local destinations = {}
+            collectZoneEntries(callStore("GetSellableZoneGroups", origin.id), destinations, {})
+            destinations = dedupeEntries(destinations)
+            for _, destination in ipairs(destinations) do
+                rememberZone(destination)
+                if unresolved <= 0 then
+                    break
+                end
+            end
+        end
+
+        app.zone_watch_catalog = catalog
+        app.zone_watch_catalog_refreshed_at_ms = now
+        return catalog
     end
 
     local manager = {}
@@ -492,6 +718,40 @@ function ZoneState.Create(options)
 
         local state = destination.zone_state or getZoneStateInfo(destination.id, false)
         return "Zone: " .. tostring(state.text or "Unknown"), state.color or getColor("unknown")
+    end
+
+    function manager:BuildWatchRows(watchZones, force)
+        local resolvedCatalog = resolveWatchCatalog(watchZones, force)
+        local rows = {}
+
+        for _, entry in ipairs(watchZones or {}) do
+            local zoneName = type(entry) == "table"
+                and trim(entry.name or entry.zone_name or "")
+                or trim(entry)
+            if zoneName ~= "" then
+                local resolved = resolvedCatalog[normalizeKey(zoneName)]
+                local state = nil
+                if type(resolved) == "table" and tonumber(resolved.id) ~= nil then
+                    state = getZoneStateInfo(resolved.id, force)
+                else
+                    state = buildZoneStateRecord(nil, "unknown", "Unavailable", false)
+                end
+
+                rows[#rows + 1] = {
+                    name = zoneName,
+                    live_name = type(resolved) == "table" and resolved.name or nil,
+                    zone_id = type(resolved) == "table" and tonumber(resolved.id) or nil,
+                    status_text = tostring(state.text or "Unknown"),
+                    status_color = state.color or getColor("unknown"),
+                    time_text = tostring(state.remain_time_text or "-"),
+                    time_color = state.color or getColor("unknown"),
+                    key = tostring(state.key or "unknown"),
+                    remain_time = state.remain_time
+                }
+            end
+        end
+
+        return rows
     end
 
     return manager
