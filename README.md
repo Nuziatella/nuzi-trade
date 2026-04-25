@@ -73,6 +73,4 @@ Saved route times are remembered per route and per vehicle type, which is the im
 - Zone-state data is read from the live client when available and falls back cleanly when it is not.
 - If you change a saved route time, it is meant to reflect your route and your vehicle, not universal truth.
 
-## Version
-
-Current version: `1.0.0`
+2.0.0
