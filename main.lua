@@ -33,6 +33,7 @@ local LAUNCHER_BUTTON_MIN_SIZE = 32
 local LAUNCHER_BUTTON_MAX_SIZE = 96
 local ROWS_PER_PAGE = 10
 local ALL_PACKS_LABEL = "All Packs"
+local ALL_ORIGINS_LABEL = "All Origins"
 local ALL_DESTINATIONS_LABEL = "All Destinations"
 local VEHICLE_TYPES = { "Hauler", "Car", "Boat" }
 local ZONE_STATE_REFRESH_INTERVAL_MS = 5000
@@ -296,6 +297,7 @@ local App = {
     syncing_combo = false,
     syncing_launcher_slider = false,
     zone_window_visible = false,
+    timer_window_visible = false,
     zone_watch_rows = {},
     zone_watch_last_refresh_ms = 0,
     zone_watch_countdown_started_ms = 0,
@@ -317,7 +319,7 @@ local App = {
         route_key = nil,
         route_label = "",
         vehicle_type = VEHICLE_TYPES[1],
-        status_text = "Select a specific destination and pack to time a route.",
+        status_text = "Select one origin, one destination, and one pack to time a route.",
         last_render_second = nil
     },
     ui = {
@@ -762,6 +764,51 @@ local function createOutlinedLabel(id, parent, text, x, y, width, height, fontSi
         __nuzi_primary = primary,
         __nuzi_outline = outlines
     }
+end
+
+local function createColorBlock(parent, x, y, width, height, r, g, b, a, layer)
+    if parent == nil or parent.CreateColorDrawable == nil then
+        return nil
+    end
+    local drawable = nil
+    pcall(function()
+        drawable = parent:CreateColorDrawable(r, g, b, a, layer or "background")
+    end)
+    if drawable == nil then
+        return nil
+    end
+    pcall(function()
+        drawable:AddAnchor("TOPLEFT", parent, x or 0, y or 0)
+        if drawable.SetExtent ~= nil then
+            drawable:SetExtent(width or 100, height or 100)
+        else
+            if drawable.SetWidth ~= nil then
+                drawable:SetWidth(width or 100)
+            end
+            if drawable.SetHeight ~= nil then
+                drawable:SetHeight(height or 100)
+            end
+        end
+    end)
+    return drawable
+end
+
+local function createSectionPanel(parent, title, x, y, width, height)
+    createColorBlock(parent, x, y, width, height, 0.08, 0.07, 0.05, 0.84, "background")
+    createColorBlock(parent, x, y, width, 38, 0.94, 0.80, 0.48, 0.10, "overlay")
+    createColorBlock(parent, x + 14, y + 38, width - 28, 1, 0.88, 0.76, 0.46, 0.16, "overlay")
+    local label = createLabel(
+        "nuziTradeSection" .. tostring(title or ""):gsub("%W", ""),
+        parent,
+        tostring(title or ""),
+        x + 16,
+        y + 12,
+        width - 32,
+        18,
+        15
+    )
+    setLabelColor(label, { 245, 224, 178, 255 })
+    return label
 end
 
 local function createButton(id, parent, text, x, y, width, height)
@@ -1484,6 +1531,7 @@ local function loadSettings()
     loadRouteTimeStore()
     App.selected_vehicle_index = getVehicleTypeIndex(settings.vehicle_type)
     App.route_timer.vehicle_type = settings.vehicle_type
+    App.timer_window_visible = false
 end
 
 local function ensurePriceIndex()
@@ -2298,6 +2346,30 @@ local function findIndexByName(entries, name)
     return nil
 end
 
+local function isAllDestinationsEntry(entry)
+    if type(entry) ~= "table" then
+        return false
+    end
+    if entry.all == true then
+        return true
+    end
+    return normalizeKey(entry.static_name or entry.name) == normalizeKey(ALL_DESTINATIONS_LABEL)
+end
+
+local function isAllOriginName(name)
+    return normalizeKey(name) == normalizeKey(ALL_ORIGINS_LABEL)
+end
+
+local function isAllOriginsEntry(entry)
+    if type(entry) ~= "table" then
+        return false
+    end
+    if entry.all_origins == true then
+        return true
+    end
+    return isAllOriginName(entry.name)
+end
+
 local function getSelectedOriginName()
     local entry = App.origins[App.selected_origin_index]
     if entry == nil then
@@ -2312,16 +2384,6 @@ local function getSelectedDestinationName()
         return ""
     end
     return tostring(entry.static_name or entry.name or "")
-end
-
-local function isAllDestinationsEntry(entry)
-    if type(entry) ~= "table" then
-        return false
-    end
-    if entry.all == true then
-        return true
-    end
-    return normalizeKey(entry.static_name or entry.name) == normalizeKey(ALL_DESTINATIONS_LABEL)
 end
 
 local function getSelectedPackName()
@@ -2345,7 +2407,7 @@ local function getCurrentConcreteRouteInfo()
     local destination = App.destinations[App.selected_destination_index]
     local packName = getSelectedPackFilter()
     local vehicleType = getSelectedVehicleType()
-    if origin == nil or destination == nil or packName == "" or isAllDestinationsEntry(destination) then
+    if origin == nil or destination == nil or packName == "" or isAllOriginsEntry(origin) or isAllDestinationsEntry(destination) then
         return nil
     end
 
@@ -2391,7 +2453,7 @@ end
 local function startRouteTimer()
     local routeInfo = getCurrentConcreteRouteInfo()
     if routeInfo == nil then
-        setRouteTimerStatus("Select a specific destination and pack to start a route timer.")
+        setRouteTimerStatus("Select one origin, one destination, and one pack to start a route timer.")
         refreshUi()
         return
     end
@@ -2559,6 +2621,13 @@ end
 local function refreshOriginCatalog(preferredName)
     ensurePriceIndex()
     local filtered = buildFallbackOriginEntries()
+    if #filtered > 0 then
+        table.insert(filtered, 1, {
+            id = nil,
+            name = ALL_ORIGINS_LABEL,
+            all_origins = true
+        })
+    end
 
     App.origins = filtered
 
@@ -2584,7 +2653,8 @@ end
 
 local function buildPackEntries(originName)
     ensurePriceIndex()
-    local patterns = buildOriginPatterns(originName)
+    local allOrigins = isAllOriginName(originName)
+    local patterns = allOrigins and nil or buildOriginPatterns(originName)
     local seen = {}
     local packs = {
         {
@@ -2595,7 +2665,7 @@ local function buildPackEntries(originName)
 
     for _, rows in pairs(App.price_index or {}) do
         for _, row in ipairs(rows or {}) do
-            if packMatchesOrigin(row.pack_name, patterns) then
+            if allOrigins or packMatchesOrigin(row.pack_name, patterns) then
                 local key = normalizeKey(row.pack_name)
                 if key ~= "" and not seen[key] then
                     seen[key] = true
@@ -2650,24 +2720,39 @@ local function refreshPacksForSelectedOrigin(preferredName)
     end
 end
 
+local buildOriginMatcherList
+local resolveOriginNameForPack
+
 local function buildStaticDestinationEntries(originName)
     ensurePriceIndex()
     local destinations = {}
     local seen = {}
     local totalRowCount = 0
+    local allOrigins = isAllOriginName(originName)
+    local originMatchers = allOrigins and buildOriginMatcherList() or nil
 
     for _, canonicalName in pairs(App.static_destinations or {}) do
         if not seen[canonicalName] then
             seen[canonicalName] = true
-            local rows = buildRouteRows(originName, canonicalName, nil)
-            if #rows > 0 then
-                totalRowCount = totalRowCount + #rows
+            local rowCount = 0
+            if allOrigins then
+                for _, row in ipairs(App.price_index[canonicalName] or {}) do
+                    if resolveOriginNameForPack(row.pack_name, originMatchers) ~= nil then
+                        rowCount = rowCount + 1
+                    end
+                end
+            else
+                local rows = buildRouteRows(originName, canonicalName, nil)
+                rowCount = #rows
+            end
+            if rowCount > 0 then
+                totalRowCount = totalRowCount + rowCount
                 table.insert(destinations, {
                     id = nil,
                     name = canonicalName,
                     static_name = canonicalName,
                     percent = nil,
-                    row_count = #rows
+                    row_count = rowCount
                 })
             end
         end
@@ -2677,7 +2762,7 @@ local function buildStaticDestinationEntries(originName)
         return normalizeKey(a.static_name or a.name) < normalizeKey(b.static_name or b.name)
     end)
 
-    if #destinations > 0 then
+    if #destinations > 0 and not allOrigins then
         table.insert(destinations, 1, {
             id = nil,
             name = ALL_DESTINATIONS_LABEL,
@@ -2788,6 +2873,77 @@ local function filterRouteRowsByPack(rows, packName)
     return filteredRows
 end
 
+buildOriginMatcherList = function()
+    local matchers = {}
+    for _, originName in ipairs(FALLBACK_ORIGINS) do
+        table.insert(matchers, {
+            name = originName,
+            patterns = buildOriginPatterns(originName)
+        })
+    end
+    return matchers
+end
+
+resolveOriginNameForPack = function(packName, matchers)
+    for _, matcher in ipairs(matchers or {}) do
+        if packMatchesOrigin(packName, matcher.patterns) then
+            return matcher.name
+        end
+    end
+    return nil
+end
+
+local function buildAllOriginRouteRows(destinationName, percent, packName)
+    ensurePriceIndex()
+    local canonicalDestination = findStaticDestinationName(destinationName)
+    if canonicalDestination == nil then
+        return {}
+    end
+
+    local selectedPack = trim(packName)
+    local wantedPack = normalizeKey(selectedPack)
+    local matchers = buildOriginMatcherList()
+    local routeRows = {}
+
+    for _, row in ipairs(App.price_index[canonicalDestination] or {}) do
+        if selectedPack == "" or normalizeKey(row.pack_name) == wantedPack then
+            local originName = resolveOriginNameForPack(row.pack_name, matchers)
+            if originName ~= nil then
+                local currentValue = nil
+                if percent ~= nil then
+                    currentValue = (tonumber(row.max_price) or 0) * percent / MAX_ROUTE_PERCENT
+                end
+                table.insert(routeRows, applyRouteTimingToRow({
+                    origin_name = originName,
+                    destination_name = canonicalDestination,
+                    pack_name = row.pack_name,
+                    currency = row.currency,
+                    max_price = row.max_price,
+                    max_price_text = row.max_price_text,
+                    current_price = currentValue
+                }, originName, canonicalDestination))
+            end
+        end
+    end
+
+    table.sort(routeRows, function(a, b)
+        local leftOrigin = tostring(a.origin_name or "")
+        local rightOrigin = tostring(b.origin_name or "")
+        if leftOrigin == rightOrigin then
+            if tostring(a.pack_name or "") == tostring(b.pack_name or "") then
+                if tostring(a.currency or "") == tostring(b.currency or "") then
+                    return (tonumber(a.max_price) or 0) < (tonumber(b.max_price) or 0)
+                end
+                return tostring(a.currency or "") < tostring(b.currency or "")
+            end
+            return tostring(a.pack_name or "") < tostring(b.pack_name or "")
+        end
+        return leftOrigin < rightOrigin
+    end)
+
+    return routeRows
+end
+
 local function buildAllDestinationRouteRows(originName, percent, packName)
     local routeRows = {}
     local selectedPack = trim(packName)
@@ -2842,7 +2998,9 @@ local function refreshSelectedRoute()
     local selectedPack = getSelectedPackFilter()
     local rows = {}
 
-    if isAllDestinationsEntry(destination) then
+    if isAllOriginsEntry(origin) then
+        rows = buildAllOriginRouteRows(destination.static_name or destination.name, manualPercent, selectedPack)
+    elseif isAllDestinationsEntry(destination) then
         rows = buildAllDestinationRouteRows(origin.name, manualPercent, selectedPack)
     else
         rows = buildRouteRows(origin.name, destination.static_name or destination.name, manualPercent)
@@ -3051,6 +3209,16 @@ toggleZoneWindow = function()
     refreshUi()
 end
 
+local function setTimerWindowVisible(show)
+    App.timer_window_visible = show and true or false
+    updateTimerWidgetVisibility()
+    refreshUi()
+end
+
+local function toggleTimerWindow()
+    setTimerWindowVisible(not App.timer_window_visible)
+end
+
 refreshUi = function()
     if App.ui.window == nil and App.ui.timer_window == nil then
         return
@@ -3074,7 +3242,7 @@ refreshUi = function()
             timerStatusText = string.format("No saved %s route time for the selected route.", selectedVehicleType)
         end
     else
-        timerRouteText = "Choose a specific destination and pack to enable route timing."
+        timerRouteText = "Choose one origin, one destination, and one pack to enable route timing."
     end
 
     if type(App.ui.controls.vehicle_buttons) == "table" then
@@ -3089,6 +3257,7 @@ refreshUi = function()
     safeSetText(App.ui.controls.timer_value, timerValueText)
     safeSetText(App.ui.controls.timer_route, timerRouteText)
     safeSetText(App.ui.controls.timer_status, timerStatusText)
+    safeSetText(App.ui.controls.timer_toggle_button, App.timer_window_visible and "Hide Timer" or "Show Timer")
     updateTimerWidgetVisibility()
 
     if not App.visible or App.ui.window == nil then
@@ -3104,7 +3273,9 @@ refreshUi = function()
     local destinationIndexText = destinationTotal > 0 and tostring(App.selected_destination_index) or "0"
     local pageCount = math.max(1, math.ceil(#App.route_rows / ROWS_PER_PAGE))
     local rowStart = ((App.route_page_index - 1) * ROWS_PER_PAGE) + 1
+    local selectedOrigin = App.origins[App.selected_origin_index]
     local selectedDestination = App.destinations[App.selected_destination_index]
+    local allOriginsMode = isAllOriginsEntry(selectedOrigin)
     local allDestinationsMode = isAllDestinationsEntry(selectedDestination)
     local selectedPack = getSelectedPackFilter()
 
@@ -3151,7 +3322,13 @@ refreshUi = function()
     safeSetText(App.ui.controls.destination_meta, string.format("%s / %d", destinationIndexText, destinationTotal))
     safeSetText(App.ui.controls.launcher_size_value, tostring(getLauncherButtonSize()))
     safeSetText(App.ui.controls.page_value, string.format("Page %d / %d", App.route_page_index, pageCount))
-    safeSetText(App.ui.controls.pack_header, allDestinationsMode and (selectedPack ~= "" and "Destination" or "Destination / Pack") or "Pack")
+    local routeNameHeader = "Pack"
+    if allOriginsMode then
+        routeNameHeader = selectedPack ~= "" and "Origin" or "Origin / Pack"
+    elseif allDestinationsMode then
+        routeNameHeader = selectedPack ~= "" and "Destination" or "Destination / Pack"
+    end
+    safeSetText(App.ui.controls.pack_header, routeNameHeader)
     safeSetText(App.ui.controls.currency_header, "Currency")
     safeSetText(App.ui.controls.cap_header, string.format("%s%%", tostring(App.current_percent or MAX_ROUTE_PERCENT)))
     safeSetText(App.ui.controls.live_header, "Live")
@@ -3163,7 +3340,14 @@ refreshUi = function()
         if widgets ~= nil then
             if row ~= nil then
                 local packText = tostring(row.pack_name or "")
-                if allDestinationsMode then
+                if allOriginsMode then
+                    local originName = tostring(row.origin_name or "")
+                    if selectedPack ~= "" then
+                        packText = originName
+                    else
+                        packText = string.format("%s - %s", originName, tostring(row.pack_name or ""))
+                    end
+                elseif allDestinationsMode then
                     local destinationName = tostring(row.destination_name or "")
                     if selectedPack ~= "" then
                         packText = destinationName
@@ -3214,9 +3398,7 @@ refreshUi = function()
 end
 
 updateTimerWidgetVisibility = function()
-    local shouldShow = App.visible
-        or App.route_timer.running
-        or (App.route_timer.pending_save and App.route_timer.route_key ~= nil)
+    local shouldShow = App.timer_window_visible == true
     if App.ui.timer_window ~= nil then
         safeShow(App.ui.timer_window, shouldShow)
     end
@@ -3288,7 +3470,7 @@ local function createUi()
         return
     end
 
-    local window = api.Interface:CreateWindow("nuziTradeWindow", "Nuzi Trade", 860, 430)
+    local window = api.Interface:CreateWindow("nuziTradeWindow", "Nuzi Trade", 920, 500)
     if window == nil then
         return
     end
@@ -3308,48 +3490,52 @@ local function createUi()
 
     App.ui.window = window
 
-    createLabel("nuziTradeOriginLabel", window, "Origin", 18, 42, 54, 18, 13)
-    App.ui.controls.origin_combo = createComboBox(window, 84, 36, 340, { "Loading..." })
-    App.ui.controls.origin_meta = createLabel("nuziTradeOriginMeta", window, "", 432, 42, 56, 18, 12)
+    createSectionPanel(window, "Route", 14, 34, 526, 126)
+    createSectionPanel(window, "Tools", 554, 34, 352, 126)
+    createSectionPanel(window, "Results", 14, 172, 892, 296)
+
+    createLabel("nuziTradeOriginLabel", window, "Origin", 32, 72, 70, 18, 13)
+    App.ui.controls.origin_combo = createComboBox(window, 118, 66, 336, { "Loading..." })
+    App.ui.controls.origin_meta = createLabel("nuziTradeOriginMeta", window, "", 462, 72, 56, 18, 12)
     if App.ui.controls.origin_combo ~= nil then
         pcall(function()
             App.ui.controls.origin_combo:SetHandler("OnSelChanged", onOriginSelected)
         end)
     end
 
-    createLabel("nuziTradePackLabel", window, "Pack", 18, 74, 54, 18, 13)
-    App.ui.controls.pack_combo = createComboBox(window, 84, 68, 340, { ALL_PACKS_LABEL })
-    App.ui.controls.pack_meta = createLabel("nuziTradePackMeta", window, "", 432, 74, 56, 18, 12)
+    createLabel("nuziTradePackLabel", window, "Pack", 32, 104, 70, 18, 13)
+    App.ui.controls.pack_combo = createComboBox(window, 118, 98, 336, { ALL_PACKS_LABEL })
+    App.ui.controls.pack_meta = createLabel("nuziTradePackMeta", window, "", 462, 104, 56, 18, 12)
     if App.ui.controls.pack_combo ~= nil then
         pcall(function()
             App.ui.controls.pack_combo:SetHandler("OnSelChanged", onPackSelected)
         end)
     end
 
-    createLabel("nuziTradeDestinationLabel", window, "Destination", 18, 106, 70, 18, 13)
-    App.ui.controls.destination_combo = createComboBox(window, 84, 100, 340, { "Loading..." })
-    App.ui.controls.destination_meta = createLabel("nuziTradeDestinationMeta", window, "", 432, 106, 56, 18, 12)
+    createLabel("nuziTradeDestinationLabel", window, "Destination", 32, 136, 76, 18, 13)
+    App.ui.controls.destination_combo = createComboBox(window, 118, 130, 336, { "Loading..." })
+    App.ui.controls.destination_meta = createLabel("nuziTradeDestinationMeta", window, "", 462, 136, 56, 18, 12)
     if App.ui.controls.destination_combo ~= nil then
         pcall(function()
             App.ui.controls.destination_combo:SetHandler("OnSelChanged", onDestinationSelected)
         end)
     end
 
-    createLabel("nuziTradeManualPercentLabel", window, "Live %", 18, 138, 54, 18, 13)
-    App.ui.controls.percent_input = createEdit("nuziTradeManualPercent", window, App.settings.manual_percent_text or "130", 84, 132, 96, 8)
+    createLabel("nuziTradeManualPercentLabel", window, "Live %", 572, 72, 64, 18, 13)
+    App.ui.controls.percent_input = createEdit("nuziTradeManualPercent", window, App.settings.manual_percent_text or "130", 650, 66, 76, 8)
 
-    createLabel("nuziTradeLauncherSizeLabel", window, "Launcher", 492, 42, 58, 18, 13)
+    createLabel("nuziTradeLauncherSizeLabel", window, "Launcher", 572, 104, 68, 18, 13)
     App.ui.controls.launcher_size_slider = createSlider(
         "nuziTradeLauncherSize",
         window,
-        552,
-        38,
-        144,
+        650,
+        100,
+        132,
         LAUNCHER_BUTTON_MIN_SIZE,
         LAUNCHER_BUTTON_MAX_SIZE,
         1
     )
-    App.ui.controls.launcher_size_value = createLabel("nuziTradeLauncherSizeValue", window, "", 700, 42, 28, 18, 12)
+    App.ui.controls.launcher_size_value = createLabel("nuziTradeLauncherSizeValue", window, "", 790, 104, 28, 18, 12)
     if App.ui.controls.launcher_size_slider ~= nil and App.ui.controls.launcher_size_slider.SetHandler ~= nil then
         App.ui.controls.launcher_size_slider:SetHandler("OnSliderChanged", function(_, raw)
             if App.syncing_launcher_slider then
@@ -3359,14 +3545,21 @@ local function createUi()
         end)
     end
 
-    local zonesButton = createButton("nuziTradeZones", window, "Zones", 736, 36, 104, 32)
+    App.ui.controls.timer_toggle_button = createButton("nuziTradeTimerToggle", window, "Show Timer", 572, 128, 104, 26)
+    if App.ui.controls.timer_toggle_button ~= nil and App.ui.controls.timer_toggle_button.SetHandler ~= nil then
+        App.ui.controls.timer_toggle_button:SetHandler("OnClick", function()
+            toggleTimerWindow()
+        end)
+    end
+
+    local zonesButton = createButton("nuziTradeZones", window, "Zones", 684, 128, 92, 26)
     if zonesButton ~= nil and zonesButton.SetHandler ~= nil then
         zonesButton:SetHandler("OnClick", function()
             toggleZoneWindow()
         end)
     end
 
-    local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 736, 84, 104, 40)
+    local refreshButton = createButton("nuziTradeRefresh", window, "Refresh", 784, 128, 92, 26)
     if refreshButton ~= nil and refreshButton.SetHandler ~= nil then
         refreshButton:SetHandler("OnClick", function()
             refreshAll(true)
@@ -3374,17 +3567,17 @@ local function createUi()
         end)
     end
 
-    App.ui.controls.page_value = createLabel("nuziTradePageValue", window, "", 18, 146, 180, 18, 12)
+    App.ui.controls.page_value = createLabel("nuziTradePageValue", window, "", 32, 206, 180, 18, 12)
     setLauncherButtonSize(getLauncherButtonSize(), false)
 
-    local prevButton = createButton("nuziTradePrevPage", window, "Prev Page", 568, 140, 88, 24)
+    local prevButton = createButton("nuziTradePrevPage", window, "Prev Page", 686, 202, 88, 24)
     if prevButton ~= nil and prevButton.SetHandler ~= nil then
         prevButton:SetHandler("OnClick", function()
             cyclePage(-1)
             refreshUi()
         end)
     end
-    local nextButton = createButton("nuziTradeNextPage", window, "Next Page", 664, 140, 88, 24)
+    local nextButton = createButton("nuziTradeNextPage", window, "Next Page", 784, 202, 88, 24)
     if nextButton ~= nil and nextButton.SetHandler ~= nil then
         nextButton:SetHandler("OnClick", function()
             cyclePage(1)
@@ -3392,20 +3585,20 @@ local function createUi()
         end)
     end
 
-    App.ui.controls.pack_header = createLabel("nuziTradePackHeader", window, "Pack", 18, 176, 274, 18, 12)
-    App.ui.controls.currency_header = createLabel("nuziTradeCurrencyHeader", window, "Currency", 306, 176, 110, 18, 12)
-    App.ui.controls.cap_header = createLabel("nuziTradeCapHeader", window, "130%", 426, 176, 64, 18, 12)
-    App.ui.controls.live_header = createLabel("nuziTradeLiveHeader", window, "Live", 504, 176, 72, 18, 12)
-    App.ui.controls.route_time_header = createLabel("nuziTradeRouteTimeHeader", window, "Route Time", 592, 176, 140, 18, 12)
+    App.ui.controls.pack_header = createLabel("nuziTradePackHeader", window, "Pack", 32, 238, 344, 18, 12)
+    App.ui.controls.currency_header = createLabel("nuziTradeCurrencyHeader", window, "Currency", 392, 238, 96, 18, 12)
+    App.ui.controls.cap_header = createLabel("nuziTradeCapHeader", window, "130%", 506, 238, 72, 18, 12)
+    App.ui.controls.live_header = createLabel("nuziTradeLiveHeader", window, "Live", 592, 238, 72, 18, 12)
+    App.ui.controls.route_time_header = createLabel("nuziTradeRouteTimeHeader", window, "Route Time", 684, 238, 140, 18, 12)
 
     for index = 1, ROWS_PER_PAGE do
-        local y = 200 + ((index - 1) * 18)
+        local y = 262 + ((index - 1) * 18)
         App.ui.rows[index] = {
-            pack = createLabel("nuziTradePackRow" .. tostring(index), window, "", 18, y, 278, 18, 12),
-            currency = createLabel("nuziTradeCurrencyRow" .. tostring(index), window, "", 306, y, 110, 18, 12),
-            cap = createLabel("nuziTradeCapRow" .. tostring(index), window, "", 426, y, 64, 18, 12),
-            live = createLabel("nuziTradeLiveRow" .. tostring(index), window, "", 504, y, 72, 18, 12),
-            route_time = createLabel("nuziTradeRouteTimeRow" .. tostring(index), window, "", 592, y, 140, 18, 12)
+            pack = createLabel("nuziTradePackRow" .. tostring(index), window, "", 32, y, 348, 18, 12),
+            currency = createLabel("nuziTradeCurrencyRow" .. tostring(index), window, "", 392, y, 96, 18, 12),
+            cap = createLabel("nuziTradeCapRow" .. tostring(index), window, "", 506, y, 72, 18, 12),
+            live = createLabel("nuziTradeLiveRow" .. tostring(index), window, "", 592, y, 72, 18, 12),
+            route_time = createLabel("nuziTradeRouteTimeRow" .. tostring(index), window, "", 684, y, 140, 18, 12)
         }
         setLabelColor(App.ui.rows[index].cap, { 255, 226, 180, 255 })
     end
@@ -3447,7 +3640,24 @@ local function createUi()
         App.ui.controls.timer_route = createLabel("nuziTradeTimerRoute", timerWindow, "", 16, 104, 360, 18, 12)
         App.ui.controls.timer_status = createLabel("nuziTradeTimerStatus", timerWindow, "", 16, 122, 360, 18, 12)
         App.ui.timer_window = timerWindow
-        safeShow(timerWindow, false)
+
+        local function onTimerWindowClosed()
+            if App.timer_window_visible then
+                setTimerWindowVisible(false)
+            end
+        end
+
+        pcall(function()
+            timerWindow:SetHandler("OnCloseByEsc", onTimerWindowClosed)
+        end)
+        pcall(function()
+            timerWindow:SetHandler("OnHide", onTimerWindowClosed)
+        end)
+        pcall(function()
+            timerWindow:SetHandler("OnClose", onTimerWindowClosed)
+        end)
+
+        safeShow(timerWindow, App.timer_window_visible)
     end
 
     local zoneWindow = api.Interface:CreateWindow("nuziTradeZoneWindow", "Nuzi Trade Zone Status", 520, 344)
@@ -3589,6 +3799,7 @@ end
 
 local function onUiReloaded()
     App.zone_state_manager = nil
+    App.timer_window_visible = false
     unloadUi()
     createUi()
     if App.visible then

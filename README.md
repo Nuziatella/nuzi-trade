@@ -7,9 +7,9 @@ Trade routing without spreadsheet roleplay.
 `Nuzi Trade` keeps the useful trade tools in one place:
 
 - browse routes by origin, pack, destination, turn-in percent, and vehicle type
-- compare a single destination or `All Destinations`
+- compare `All Origins` for one destination, or one origin across `All Destinations`
 - keep a movable launcher icon with adjustable size
-- route timer stopwatch window for real timed runs
+- route timer stopwatch window for real timed runs, hidden until you click `Show Timer`
 - save route times per route and per vehicle type
 - open a separate `Zones` window for watched conflict zones
 
@@ -29,8 +29,9 @@ Saved data lives in `nuzi-trade/.data` so route timers and settings survive upda
 4. Pick a destination.
 5. Set the percent you want to evaluate.
 6. Click `Refresh` to rebuild the table for the current selection.
-7. Open `Zones` if you want the watched-zone status window beside it.
-8. Use the launcher size slider if you want the icon larger or smaller.
+7. Click `Show Timer` when you want the route timer window.
+8. Open `Zones` if you want the watched-zone status window beside it.
+9. Use the launcher size slider if you want the icon larger or smaller.
 
 That is still much nicer than pretending your memory is a market tool.
 
@@ -41,10 +42,13 @@ That is still much nicer than pretending your memory is a market tool.
 The main window lets you:
 
 - choose an origin to rebuild the available pack and destination lists
+- choose `All Origins` to compare every origin for one destination
 - filter by a specific pack or use `All Packs`
 - filter by a specific destination or use `All Destinations`
 - compare values with a custom percent input
 - switch between `Hauler`, `Car`, and `Boat` timing context. (You need to do your own runs and save per vehicle type to populate the table.)
+
+`All Origins` and `All Destinations` cannot be used at the same time. When `All Origins` is selected, the destination list only shows specific destinations.
 
 `Refresh` rebuilds the table from the current origin, pack, destination, and percent instead of guessing what you meant.
 
@@ -61,6 +65,8 @@ It tracks:
 The window can stay open on its own, and the displayed timer counts down from the last live refresh so you can glance at it instead of doing clock math in your head.
 
 ### Route Timer
+
+The timer window is hidden by default. Click `Show Timer` in the main trade window when you want to time a route.
 
 The timer window lets you time a specific route and save the result.
 
